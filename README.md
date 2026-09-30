@@ -1,5 +1,7 @@
 # mssql_mcp_server-rs
 
+中文 | [English](README_EN.md)
+
 Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现。
 
 基于官方 Rust SDK [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 与
