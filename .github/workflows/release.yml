@@ -1,6 +1,9 @@
 # Release：push 形如 v0.1.0 的 tag 时，三平台构建 release 二进制并发布 GitHub Release。
 # 附件为可直接下载执行的裸二进制（按平台命名，不做压缩打包）。
 # 发布流程：更新 Cargo.toml 的 version -> commit -> git tag v0.1.0 -> git push origin v0.1.0
+#
+# 结构：build（三平台并行构建并上传 artifact） -> release（单点发布）。
+# release notes 只在 release job 生成一次，避免多份重复的 "Full Changelog"。
 
 name: Release
 
@@ -15,7 +18,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
+  build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -52,12 +55,28 @@ jobs:
         shell: bash
         run: mv target/release/mssql_mcp_server-rs.exe "mssql_mcp_server-rs-${{ matrix.target }}"
 
-      # 三个 job 并发上传到同一个 release（release 不存在时自动创建，
-      # generate_release_notes 基于 commits/PRs 自动生成变更说明）
-      - name: Upload to GitHub Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: mssql_mcp_server-rs-*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # 下载全部平台产物并合并到 dist/ 目录
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 单点创建 Release 并上传所有二进制；notes 只生成一次
+      - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: mssql_mcp_server-rs-*
+          files: dist/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
