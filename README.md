@@ -12,9 +12,9 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
   - `SELECT` 返回 CSV 格式结果（首行列名）
   - NULL 值渲染为 `NULL`、二进制渲染为十六进制、时间渲染为 ISO 格式
   - 对 `INFORMATION_SCHEMA.TABLES` 的查询返回 `Tables_in_{database}` 风格的表清单
-- **工具 `describe_table`**：查看表或视图的结构（列名、类型、可空性、长度/精度、默认值）
+- **工具 `describe_table`**：查看表或视图的结构（列名、类型、可空性、长度/精度、默认值）与索引信息（名称、类型、唯一性、主键、键列、包含列）
   - 参数 `table` 接受 `users`、`dbo.users` 或视图名；表名经参数绑定传入，无注入风险
-  - 返回 CSV，按列顺序排列；不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA` 列
+  - 返回 CSV，按列顺序排列；其后为 `INDEXES` 分节（CSV，无索引时仅表头；索引查询使用 `STRING_AGG`，需 SQL Server 2017+）；不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列
 - **资源 `mssql://{table}/data`**：每张用户表/视图一个资源，读取前 100 行；资源名称区分 `Table: x` / `View: x`
 
 ## 环境变量

@@ -66,7 +66,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Describe the structure of a SQL Server table or view (column names, types, nullability, length/precision, defaults)"
+        description = "Describe the structure of a SQL Server table or view (column names, types, nullability, length/precision, defaults, indexes)"
     )]
     async fn describe_table(
         &self,
