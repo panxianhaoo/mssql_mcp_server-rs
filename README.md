@@ -17,7 +17,8 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 - **工具 `describe_table`**：查看表或视图的结构（列名、类型、可空性、长度/精度、默认值）与索引信息（名称、类型、唯一性、主键、键列、包含列）
   - 参数 `table` 接受 `users`、`dbo.users` 或视图名；表名经参数绑定传入，无注入风险
   - 返回 CSV，按列顺序排列；其后为 `INDEXES` 分节（CSV，无索引时仅表头；索引查询使用 `STRING_AGG`，需 SQL Server 2017+）；不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列
-- **资源 `mssql://{table}/data`**：每张用户表/视图一个资源，读取前 100 行；资源名称区分 `Table: x` / `View: x`
+- **资源 `mssql://{table}/data`**：每张用户表/视图一个资源，读取前 100 行；资源名称区分 `Table: x` / `View: x`；`resources/list` 按 cursor 分页（每页最多 500 条），大目录下响应体有界
+- **连接池**：内置 bb8 连接池（最多 4 个连接，借出前 `SELECT 1` 探活），复用连接省去每请求的 TCP/TDS 握手开销
 
 ## 环境变量
 

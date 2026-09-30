@@ -16,7 +16,8 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
 - **Tool `describe_table`**: inspect the structure of a table or view (column names, types, nullability, length/precision, defaults) plus index information (name, type, uniqueness, primary key, key columns, included columns)
   - The `table` parameter accepts `users`, `dbo.users`, or a view name; table names are passed via parameter binding — no injection risk
   - Returns CSV ordered by column position, followed by an `INDEXES` section (CSV; header only when there are no indexes; the index query uses `STRING_AGG`, requires SQL Server 2017+). Without a schema qualifier, all schemas are matched and the result includes `TABLE_SCHEMA`/`OBJECT_SCHEMA` columns
-- **Resource `mssql://{table}/data`**: one resource per user table/view, reading the first 100 rows; resource names distinguish `Table: x` / `View: x`
+- **Resource `mssql://{table}/data`**: one resource per user table/view, reading the first 100 rows; resource names distinguish `Table: x` / `View: x`; `resources/list` is cursor-paginated (max 500 items per page), keeping response size bounded on large catalogs
+- **Connection pool**: built-in bb8 pool (max 4 connections, `SELECT 1` liveness check on checkout), reusing connections instead of a TCP/TDS handshake per request
 
 ## Environment Variables
 
