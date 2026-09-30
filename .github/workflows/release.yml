@@ -1,0 +1,59 @@
+# Release：push 形如 v0.1.0 的 tag 时，三平台构建 release 二进制并发布 GitHub Release。
+# 发布流程：更新 Cargo.toml 的 version -> commit -> git tag v0.1.0 -> git push origin v0.1.0
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            # x86_64 Linux
+            archive: mssql_mcp_server-rs-x86_64-unknown-linux-gnu.tar.gz
+          - os: windows-latest
+            # x86_64 Windows（含 Windows 集成认证）
+            archive: mssql_mcp_server-rs-x86_64-pc-windows-msvc.zip
+          - os: macos-latest
+            # Apple Silicon macOS
+            archive: mssql_mcp_server-rs-aarch64-apple-darwin.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.archive }} -C target/release mssql_mcp_server-rs
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/mssql_mcp_server-rs.exe -DestinationPath ${{ matrix.archive }}
+
+      # 三个 job 并发上传到同一个 release（release 不存在时自动创建，
+      # generate_release_notes 基于 commits/PRs 自动生成变更说明）
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
