@@ -19,7 +19,7 @@ fn init_logging() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     init_logging();
     log::info!("Starting MSSQL MCP server...");
 
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(config) => config,
         Err(e) => {
             log::error!("{e}");
-            return Err(e.into());
+            return Err(e);
         }
     };
     log::info!(
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db_config.server,
         db_config.port,
         db_config.database,
-        db_config.user,
+        db_config.auth.describe(),
         db_config.encrypt,
         db_config.is_azure()
     );

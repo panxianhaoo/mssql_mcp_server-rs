@@ -130,7 +130,7 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use tiberius::numeric::Numeric;
-    use tiberius::time::{Date, SmallDateTime};
+    use tiberius::time::Date;
 
     #[test]
     fn days_1900_constant_is_self_consistent_with_chrono() {
