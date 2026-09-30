@@ -1,4 +1,5 @@
 # Release：push 形如 v0.1.0 的 tag 时，三平台构建 release 二进制并发布 GitHub Release。
+# 附件为可直接下载执行的裸二进制（按平台命名，不做压缩打包）。
 # 发布流程：更新 Cargo.toml 的 version -> commit -> git tag v0.1.0 -> git push origin v0.1.0
 
 name: Release
@@ -22,14 +23,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            # x86_64 Linux
-            archive: mssql_mcp_server-rs-x86_64-unknown-linux-gnu.tar.gz
+            # x86_64 Linux（下载后需 chmod +x）
+            target: linux-x86_64
           - os: windows-latest
-            # x86_64 Windows（含 Windows 集成认证）
-            archive: mssql_mcp_server-rs-x86_64-pc-windows-msvc.zip
+            # x86_64 Windows（含 Windows 集成认证），exe 可直接运行
+            target: windows-x86_64.exe
           - os: macos-latest
-            # Apple Silicon macOS
-            archive: mssql_mcp_server-rs-aarch64-apple-darwin.tar.gz
+            # Apple Silicon macOS（下载后需 chmod +x）
+            target: macos-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -40,20 +41,23 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Package (unix)
+      # 裸二进制按平台重命名，避免不同平台的同名文件在 Release 中冲突
+      - name: Stage binary (unix)
         if: runner.os != 'Windows'
-        run: tar -czf ${{ matrix.archive }} -C target/release mssql_mcp_server-rs
+        shell: bash
+        run: mv target/release/mssql_mcp_server-rs "mssql_mcp_server-rs-${{ matrix.target }}"
 
-      - name: Package (windows)
+      - name: Stage binary (windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/release/mssql_mcp_server-rs.exe -DestinationPath ${{ matrix.archive }}
+        shell: bash
+        run: mv target/release/mssql_mcp_server-rs.exe "mssql_mcp_server-rs-${{ matrix.target }}"
 
       # 三个 job 并发上传到同一个 release（release 不存在时自动创建，
       # generate_release_notes 基于 commits/PRs 自动生成变更说明）
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.archive }}
+          files: mssql_mcp_server-rs-*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
