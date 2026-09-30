@@ -1,6 +1,6 @@
 //! 数据库访问：建立连接、执行查询、列出与读取表。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, QueryItem};
 use tokio::net::TcpStream;
@@ -69,14 +69,13 @@ async fn collect_first_resultset(stream: tiberius::QueryStream<'_>) -> Result<Re
             }
             QueryItem::Row(row) => {
                 if columns.is_none() {
-                    columns = Some(
-                        row.columns()
-                            .iter()
-                            .map(|c| c.name().to_string())
-                            .collect(),
-                    );
+                    columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
                 }
-                rows.push(row.cells().map(|(_, data)| column_data_to_string(data)).collect());
+                rows.push(
+                    row.cells()
+                        .map(|(_, data)| column_data_to_string(data))
+                        .collect(),
+                );
             }
         }
     }

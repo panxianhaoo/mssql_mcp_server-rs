@@ -2,7 +2,7 @@
 
 use std::env;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 const DEFAULT_SERVER: &str = "localhost";
 const DEFAULT_PORT: u16 = 1433;
@@ -12,10 +12,7 @@ const AZURE_DOMAIN_MARKER: &str = ".database.windows.net";
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthKind {
     /// SQL Server 登录（用户名 + 密码）。
-    SqlServer {
-        user: String,
-        password: String,
-    },
+    SqlServer { user: String, password: String },
     /// Windows 集成认证：使用当前登录用户身份，无需凭据（仅 Windows 平台存在此变体）。
     #[cfg(windows)]
     WindowsIntegrated,
@@ -241,7 +238,10 @@ mod tests {
     #[test]
     fn parse_auth_mode_rejects_windows_off_windows() {
         for value in ["windows", "win", "integrated"] {
-            assert!(parse_auth_mode(Some(value)).is_err(), "should reject: {value}");
+            assert!(
+                parse_auth_mode(Some(value)).is_err(),
+                "should reject: {value}"
+            );
         }
     }
 

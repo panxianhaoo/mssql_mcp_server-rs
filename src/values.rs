@@ -3,8 +3,8 @@
 //! 时间类型通过换算为 `chrono` 类型后格式化；NULL 输出为 `NULL`。
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use tiberius::time::{DateTime2, DateTimeOffset, Time};
 use tiberius::ColumnData;
+use tiberius::time::{DateTime2, DateTimeOffset, Time};
 
 /// `date` 类型的天数起点：公元 1 年 1 月 1 日（`Date::days()` 的定义）。
 const CE_EPOCH: i32 = 1;
@@ -16,23 +16,9 @@ const DAYS_1900_TO_CE: i32 = 693_596;
 pub fn column_data_to_string(data: &ColumnData<'_>) -> String {
     use ColumnData::*;
     match data {
-        U8(None)
-        | I16(None)
-        | I32(None)
-        | I64(None)
-        | F32(None)
-        | F64(None)
-        | Bit(None)
-        | String(None)
-        | Guid(None)
-        | Binary(None)
-        | Numeric(None)
-        | Xml(None)
-        | DateTime(None)
-        | SmallDateTime(None)
-        | Time(None)
-        | Date(None)
-        | DateTime2(None)
+        U8(None) | I16(None) | I32(None) | I64(None) | F32(None) | F64(None) | Bit(None)
+        | String(None) | Guid(None) | Binary(None) | Numeric(None) | Xml(None) | DateTime(None)
+        | SmallDateTime(None) | Time(None) | Date(None) | DateTime2(None)
         | DateTimeOffset(None) => "NULL".to_string(),
         U8(Some(v)) => v.to_string(),
         I16(Some(v)) => v.to_string(),
@@ -45,8 +31,11 @@ pub fn column_data_to_string(data: &ColumnData<'_>) -> String {
         Guid(Some(v)) => v.to_string(),
         Binary(Some(v)) => bytes_to_hex(v),
         Numeric(Some(v)) => v.to_string(),
-        Xml(Some(v)) => v.clone().into_owned().into_string(),        DateTime(Some(v)) => format_legacy_datetime(v.days(), v.seconds_fragments()),
-        SmallDateTime(Some(v)) => format_legacy_datetime(i32::from(v.days()), u32::from(v.seconds_fragments())),
+        Xml(Some(v)) => v.clone().into_owned().into_string(),
+        DateTime(Some(v)) => format_legacy_datetime(v.days(), v.seconds_fragments()),
+        SmallDateTime(Some(v)) => {
+            format_legacy_datetime(i32::from(v.days()), u32::from(v.seconds_fragments()))
+        }
         Time(Some(v)) => format_time(v),
         Date(Some(v)) => format_date(v.days()),
         DateTime2(Some(v)) => format_date_time2(v),
@@ -121,8 +110,7 @@ fn naive_time_from_time(time: Time) -> NaiveTime {
     let total_nanos = time.increments() * 10u64.pow(9 - scale);
     let secs = (total_nanos / 1_000_000_000) as u32;
     let subsec_nanos = (total_nanos % 1_000_000_000) as u32;
-    NaiveTime::from_num_seconds_from_midnight_opt(secs, subsec_nanos)
-        .unwrap_or(NaiveTime::MIN)
+    NaiveTime::from_num_seconds_from_midnight_opt(secs, subsec_nanos).unwrap_or(NaiveTime::MIN)
 }
 
 #[cfg(test)]
@@ -200,10 +188,15 @@ mod tests {
 
     #[test]
     fn formats_legacy_datetime() {
-        let days = (NaiveDate::from_ymd_opt(2024, 6, 15).unwrap().num_days_from_ce()
+        let days = (NaiveDate::from_ymd_opt(2024, 6, 15)
+            .unwrap()
+            .num_days_from_ce()
             - DAYS_1900_TO_CE) as i32;
         // 14:30:00 = 300 fragments/秒 × 52200 秒
-        assert_eq!(format_legacy_datetime(days, 300 * 52_200), "2024-06-15 14:30:00");
+        assert_eq!(
+            format_legacy_datetime(days, 300 * 52_200),
+            "2024-06-15 14:30:00"
+        );
     }
 
     #[test]
@@ -228,6 +221,9 @@ mod tests {
     #[test]
     fn formats_numeric_and_guid() {
         let numeric = Numeric::new_with_scale(12345, 2);
-        assert_eq!(column_data_to_string(&ColumnData::Numeric(Some(numeric))), "123.45");
+        assert_eq!(
+            column_data_to_string(&ColumnData::Numeric(Some(numeric))),
+            "123.45"
+        );
     }
 }

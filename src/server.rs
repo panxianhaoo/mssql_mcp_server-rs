@@ -10,7 +10,7 @@ use rmcp::model::{
     ResourceContents, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::config::DbConfig;
 use crate::db;
@@ -47,7 +47,9 @@ impl McpServer {
         }
     }
 
-    #[tool(description = "Execute a read-only SQL query (a single SELECT; WITH ... SELECT is allowed) on the SQL Server")]
+    #[tool(
+        description = "Execute a read-only SQL query (a single SELECT; WITH ... SELECT is allowed) on the SQL Server"
+    )]
     async fn execute_sql(
         &self,
         Parameters(args): Parameters<ExecuteSqlArgs>,
@@ -63,7 +65,9 @@ impl McpServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
-    #[tool(description = "Describe the structure of a SQL Server table or view (column names, types, nullability, length/precision, defaults)")]
+    #[tool(
+        description = "Describe the structure of a SQL Server table or view (column names, types, nullability, length/precision, defaults)"
+    )]
     async fn describe_table(
         &self,
         Parameters(args): Parameters<DescribeTableArgs>,

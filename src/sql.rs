@@ -1,6 +1,6 @@
 //! SQL 辅助函数：表名校验（防注入）、SELECT 判断与只读查询白名单。
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// 判断是否为合法的 SQL 标识符（字母、数字、下划线）。
 fn is_identifier(s: &str) -> bool {
@@ -29,10 +29,9 @@ pub fn parse_table_name(table_name: &str) -> Result<(Option<String>, String)> {
     let parts: Vec<&str> = table_name.split('.').collect();
     match parts.as_slice() {
         [table] if is_identifier(table) => Ok((None, table.to_string())),
-        [schema, table] if is_identifier(schema) && is_identifier(table) => Ok((
-            Some(schema.to_string()),
-            table.to_string(),
-        )),
+        [schema, table] if is_identifier(schema) && is_identifier(table) => {
+            Ok((Some(schema.to_string()), table.to_string()))
+        }
         _ => bail!("Invalid table name: {table_name}"),
     }
 }
@@ -75,7 +74,10 @@ pub fn is_select_query(query: &str) -> bool {
 
 /// 判断查询是否为对 `INFORMATION_SCHEMA.TABLES` 的查询（输出格式特判）。
 pub fn is_tables_listing_query(query: &str) -> bool {
-    is_select_query(query) && query.to_ascii_uppercase().contains("INFORMATION_SCHEMA.TABLES")
+    is_select_query(query)
+        && query
+            .to_ascii_uppercase()
+            .contains("INFORMATION_SCHEMA.TABLES")
 }
 
 /// 判断语句是否为只读查询：单条语句，且顶层语句为 `SELECT`，
@@ -122,12 +124,16 @@ fn tokenize(input: &str) -> Vec<Token> {
         } else if c.is_ascii_alphabetic() || matches!(c, '_' | '@' | '#') {
             let mut end = i;
             while end < chars.len()
-                && (chars[end].is_ascii_alphanumeric() || matches!(chars[end], '_' | '@' | '#' | '$'))
+                && (chars[end].is_ascii_alphanumeric()
+                    || matches!(chars[end], '_' | '@' | '#' | '$'))
             {
                 end += 1;
             }
             tokens.push(Token::Ident(
-                chars[i..end].iter().collect::<String>().to_ascii_lowercase(),
+                chars[i..end]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
             ));
             i = end;
         } else {
@@ -259,10 +265,7 @@ mod tests {
 
     #[test]
     fn validate_table_name_accepts_qualified_table() {
-        assert_eq!(
-            validate_table_name("dbo.users").unwrap(),
-            "[dbo].[users]"
-        );
+        assert_eq!(validate_table_name("dbo.users").unwrap(), "[dbo].[users]");
     }
 
     #[test]
@@ -393,7 +396,9 @@ mod tests {
             "WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t"
         ));
         assert!(!is_read_only_query("WITH t AS (SELECT 1) DELETE FROM x"));
-        assert!(!is_read_only_query("WITH t AS (SELECT 1) UPDATE x SET a = 1"));
+        assert!(!is_read_only_query(
+            "WITH t AS (SELECT 1) UPDATE x SET a = 1"
+        ));
     }
 
     #[test]
