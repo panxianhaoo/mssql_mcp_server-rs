@@ -240,7 +240,7 @@ async fn describe_indexes(
 /// 构造索引查询 SQL：`schema` 为 `Some` 时附加 `SCHEMA_NAME = @P2` 过滤；
 /// 主键排在最前，其余按 schema、名称排序。
 fn indexes_query(schema: Option<&str>) -> String {
-    const BASE: &str = "SELECT SCHEMA_NAME(o.schema_id) AS OBJECT_SCHEMA, \
+    const SELECT_FROM: &str = "SELECT SCHEMA_NAME(o.schema_id) AS OBJECT_SCHEMA, \
          i.name AS INDEX_NAME, i.type_desc AS INDEX_TYPE, \
          CASE WHEN i.is_unique = 1 THEN 'YES' ELSE 'NO' END AS IS_UNIQUE, \
          CASE WHEN i.is_primary_key = 1 THEN 'YES' ELSE 'NO' END AS IS_PRIMARY_KEY, \
@@ -254,10 +254,13 @@ fn indexes_query(schema: Option<&str>) -> String {
              ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
          JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
          WHERE o.name = @P1";
+    const GROUP_BY: &str =
+        " GROUP BY o.schema_id, i.name, i.type_desc, i.is_unique, i.is_primary_key";
     const ORDER_BY: &str = " ORDER BY IS_PRIMARY_KEY DESC, OBJECT_SCHEMA, INDEX_NAME";
     match schema {
-        Some(_) => format!("{BASE} AND SCHEMA_NAME(o.schema_id) = @P2{ORDER_BY}"),
-        None => format!("{BASE}{ORDER_BY}"),
+        // schema 过滤作用于行级 WHERE，必须位于 GROUP BY 之前。
+        Some(_) => format!("{SELECT_FROM} AND SCHEMA_NAME(o.schema_id) = @P2{GROUP_BY}{ORDER_BY}"),
+        None => format!("{SELECT_FROM}{GROUP_BY}{ORDER_BY}"),
     }
 }
 
@@ -305,20 +308,31 @@ mod tests {
     #[test]
     fn indexes_query_without_schema_matches_all_schemas() {
         let sql = indexes_query(None);
-        assert!(sql.contains("WHERE o.name = @P1 ORDER BY"));
+        assert!(sql.contains("WHERE o.name = @P1 GROUP BY"));
         assert!(!sql.contains("@P2"));
     }
 
     #[test]
     fn indexes_query_with_schema_filters_by_schema() {
         let sql = indexes_query(Some("dbo"));
-        assert!(sql.contains("WHERE o.name = @P1 AND SCHEMA_NAME(o.schema_id) = @P2"));
+        assert!(sql.contains("WHERE o.name = @P1 AND SCHEMA_NAME(o.schema_id) = @P2 GROUP BY"));
     }
 
     #[test]
     fn indexes_query_orders_primary_key_first() {
         for sql in [indexes_query(None), indexes_query(Some("dbo"))] {
             assert!(sql.ends_with(" ORDER BY IS_PRIMARY_KEY DESC, OBJECT_SCHEMA, INDEX_NAME"));
+        }
+    }
+
+    #[test]
+    fn indexes_query_groups_non_aggregated_columns() {
+        // SELECT 里的 SCHEMA_NAME(o.schema_id)、i.name 等都必须出现在 GROUP BY 中，
+        // 否则表有索引时 SQL Server 报 8120。
+        for sql in [indexes_query(None), indexes_query(Some("dbo"))] {
+            assert!(sql.contains(
+                "GROUP BY o.schema_id, i.name, i.type_desc, i.is_unique, i.is_primary_key"
+            ));
         }
     }
 }
