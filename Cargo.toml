@@ -8,7 +8,9 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 rmcp = { version = "3.5", features = ["transport-io"] }
-tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls", "chrono"] }
+# tiberius 锁定 0.12：与 bb8-tiberius 0.16 的依赖一致，避免引入两套驱动类型。
+# 0.12 没有 tds80 feature（0.13 起才有），TDS 7.3 协商即可连接所有受支持的 SQL Server。
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures-util = "0.3"
@@ -17,10 +19,12 @@ serde = { version = "1", features = ["derive"] }
 schemars = "1"
 log = "0.4"
 env_logger = "0.11"
+bb8 = "0.9.1"
+bb8-tiberius = "0.16.0"
 
 # Windows 集成认证（SSPI）：仅 Windows 目标启用 winauth feature。
 [target.'cfg(windows)'.dependencies]
-tiberius = { version = "0.13", default-features = false, features = ["winauth"] }
+tiberius = { version = "0.12", default-features = false, features = ["winauth"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

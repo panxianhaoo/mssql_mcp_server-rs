@@ -1,10 +1,11 @@
-//! 数据库访问：建立连接、执行查询、列出与读取表。
+//! 数据库访问：连接池、执行查询、列出与读取表。
 
 use anyhow::{Context, Result, bail};
+use bb8_tiberius::ConnectionManager;
 use futures_util::StreamExt;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, QueryItem};
+use tiberius::{AuthMethod, Client, EncryptionLevel, QueryItem};
 use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tokio_util::compat::Compat;
 
 use crate::config::{AuthKind, DbConfig};
 use crate::sql::{is_read_only_query, is_tables_listing_query};
@@ -16,15 +17,21 @@ struct Resultset {
     rows: Vec<Vec<String>>,
 }
 
-/// 建立到 SQL Server 的连接（每次请求一个短连接，与参考实现一致）。
-async fn connect(config: &DbConfig) -> Result<Client<Compat<TcpStream>>> {
-    let mut tds_config = Config::new();
+/// 连接池大小：stdio 单客户端场景，少量连接足够覆盖并发请求。
+const DB_POOL_MAX_SIZE: u32 = 4;
+
+/// 数据库连接池（bb8 + bb8-tiberius 管理客户端连接，按需复用）。
+pub type DbPool = bb8::Pool<ConnectionManager>;
+
+/// 从应用配置构建 tiberius 连接配置。
+fn tiberius_config(config: &DbConfig) -> tiberius::Config {
+    let mut tds_config = tiberius::Config::new();
     tds_config.host(&config.server);
     tds_config.port(config.port);
     tds_config.database(&config.database);
     tds_config.authentication(match &config.auth {
         AuthKind::SqlServer { user, password } => AuthMethod::sql_server(user, password),
-        // tiberius 0.13：Integrated = SSPI 当前登录用户（Windows + winauth feature）。
+        // Integrated = SSPI 当前登录用户（Windows + winauth feature）。
         #[cfg(windows)]
         AuthKind::WindowsIntegrated => AuthMethod::Integrated,
     });
@@ -36,14 +43,15 @@ async fn connect(config: &DbConfig) -> Result<Client<Compat<TcpStream>>> {
     if config.trust_server_certificate {
         tds_config.trust_cert();
     }
+    tds_config
+}
 
-    let tcp = TcpStream::connect((config.server.as_str(), config.port))
-        .await
-        .with_context(|| format!("failed to connect to {}", config.server))?;
-    tcp.set_nodelay(true).context("failed to set TCP_NODELAY")?;
-    Client::connect(tds_config, tcp.compat_write())
-        .await
-        .context("failed to complete TDS handshake")
+/// 构建连接池（惰性建连：数据库暂不可达时服务器仍可启动，调用时再报错）。
+pub fn new_pool(config: &DbConfig) -> DbPool {
+    bb8::Pool::builder()
+        .max_size(DB_POOL_MAX_SIZE)
+        .test_on_check_out(true)
+        .build_unchecked(ConnectionManager::new(tiberius_config(config)))
 }
 
 /// 消费查询流，收集第一个结果集（能正确处理空结果集的列名）。
@@ -124,8 +132,11 @@ pub struct DbObject {
 }
 
 /// 列出当前数据库的所有用户表与视图。
-pub async fn list_tables_and_views(config: &DbConfig) -> Result<Vec<DbObject>> {
-    let mut client = connect(config).await?;
+pub async fn list_tables_and_views(pool: &DbPool) -> Result<Vec<DbObject>> {
+    let mut client = pool
+        .get()
+        .await
+        .context("failed to get a connection from pool")?;
     let stream = client
         .simple_query(
             "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES \
@@ -149,8 +160,11 @@ pub async fn list_tables_and_views(config: &DbConfig) -> Result<Vec<DbObject>> {
 }
 
 /// 读取表或视图的前 100 行（对象名必须已经过 `validate_table_name` 转义）。
-pub async fn read_table(config: &DbConfig, safe_table: &str) -> Result<String> {
-    let mut client = connect(config).await?;
+pub async fn read_table(pool: &DbPool, safe_table: &str) -> Result<String> {
+    let mut client = pool
+        .get()
+        .await
+        .context("failed to get a connection from pool")?;
     let query = format!("SELECT TOP 100 * FROM {safe_table}");
     let stream = client
         .simple_query(query)
@@ -167,12 +181,11 @@ pub async fn read_table(config: &DbConfig, safe_table: &str) -> Result<String> {
 /// 覆盖表与视图，schema 匹配语义一致。
 /// 表名经参数绑定传入，无注入风险；`schema` 为 `None` 时在所有 schema 中
 /// 按表名匹配（结果包含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列以示区分）。
-pub async fn describe_table(
-    config: &DbConfig,
-    schema: Option<&str>,
-    table: &str,
-) -> Result<String> {
-    let mut client = connect(config).await?;
+pub async fn describe_table(pool: &DbPool, schema: Option<&str>, table: &str) -> Result<String> {
+    let mut client = pool
+        .get()
+        .await
+        .context("failed to get a connection from pool")?;
     let columns = describe_columns(&mut client, schema, table).await?;
     if columns.rows.is_empty() {
         bail!("No columns found for table '{table}'");
@@ -250,7 +263,7 @@ fn indexes_query(schema: Option<&str>) -> String {
 
 /// 执行只读 SQL 查询：仅接受单条 SELECT（含 `WITH ... SELECT`），
 /// 任何修改语句（INSERT/UPDATE/DELETE/DDL/EXEC 等）或多语句批次一律拒绝。
-pub async fn execute_query(config: &DbConfig, query: &str) -> Result<String> {
+pub async fn execute_query(pool: &DbPool, database: &str, query: &str) -> Result<String> {
     if !is_read_only_query(query) {
         bail!(
             "read-only mode: only a single read-only SELECT query is allowed \
@@ -259,7 +272,10 @@ pub async fn execute_query(config: &DbConfig, query: &str) -> Result<String> {
         );
     }
 
-    let mut client = connect(config).await?;
+    let mut client = pool
+        .get()
+        .await
+        .context("failed to get a connection from pool")?;
     let stream = client
         .simple_query(query)
         .await
@@ -268,7 +284,7 @@ pub async fn execute_query(config: &DbConfig, query: &str) -> Result<String> {
 
     // 对 INFORMATION_SCHEMA.TABLES 的查询输出 mysql 风格的表清单（对齐参考实现）。
     if is_tables_listing_query(query) && !resultset.columns.is_empty() {
-        let header = format!("Tables_in_{}", config.database);
+        let header = format!("Tables_in_{database}");
         let mut lines = vec![header];
         lines.extend(
             resultset
