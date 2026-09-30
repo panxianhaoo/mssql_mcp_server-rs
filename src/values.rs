@@ -188,10 +188,10 @@ mod tests {
 
     #[test]
     fn formats_legacy_datetime() {
-        let days = (NaiveDate::from_ymd_opt(2024, 6, 15)
+        let days = NaiveDate::from_ymd_opt(2024, 6, 15)
             .unwrap()
             .num_days_from_ce()
-            - DAYS_1900_TO_CE) as i32;
+            - DAYS_1900_TO_CE;
         // 14:30:00 = 300 fragments/秒 × 52200 秒
         assert_eq!(
             format_legacy_datetime(days, 300 * 52_200),
