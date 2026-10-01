@@ -8,9 +8,12 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 rmcp = { version = "3.5", features = ["transport-io"] }
-# tiberius 锁定 0.12：与 bb8-tiberius 0.16 的依赖一致，避免引入两套驱动类型。
-# 0.12 没有 tds80 feature（0.13 起才有），TDS 7.3 协商即可连接所有受支持的 SQL Server。
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# tiberius 用 0.13 而非 bb8-tiberius 锁定的 0.12：0.12 在解析
+# sql_variant / geography / hierarchyid 等 UDT 列的元数据时会 `todo!()` panic，
+# 查询这类列会直接挂住整个请求（见 src/pool.rs 的模块说明）。
+# 0.13 已实现 UDT 解码，故此处自行实现 bb8 的 ManageConnection，
+# 不再依赖尚未跟上 0.13 的 bb8-tiberius。
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures-util = "0.3"
@@ -20,11 +23,10 @@ schemars = "1"
 log = "0.4"
 env_logger = "0.11"
 bb8 = "0.9.1"
-bb8-tiberius = "0.16.0"
 
 # Windows 集成认证（SSPI）：仅 Windows 目标启用 winauth feature。
 [target.'cfg(windows)'.dependencies]
-tiberius = { version = "0.12", default-features = false, features = ["winauth"] }
+tiberius = { version = "0.13", default-features = false, features = ["winauth"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

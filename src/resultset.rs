@@ -6,7 +6,7 @@
 use futures_util::StreamExt;
 use tiberius::QueryItem;
 
-use crate::values::column_data_to_string;
+use crate::values::column_data_to_string_typed;
 
 /// 单个结果集（列名 + 每行的字符串值）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,9 +52,13 @@ pub async fn collect_first_resultset(
                 if columns.is_none() {
                     columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
                 }
+                // 逐格带上列的 TDS 类型：`money` 与 `float` 在 tiberius 侧都是
+                // f64，只有靠 ColumnType 才能分别按定点/浮点语义渲染。
                 rows.push(
                     row.cells()
-                        .map(|(_, data)| column_data_to_string(data))
+                        .map(|(column, data)| {
+                            column_data_to_string_typed(data, column.column_type())
+                        })
                         .collect(),
                 );
             }

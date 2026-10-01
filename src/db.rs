@@ -1,7 +1,6 @@
 //! 数据库访问：连接池、执行查询、列出与读取表、查询表结构。
 
 use anyhow::{Context, Result, bail};
-use bb8_tiberius::ConnectionManager;
 use tiberius::{AuthMethod, Client, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio_util::compat::Compat;
@@ -10,10 +9,12 @@ use crate::config::{AuthKind, DbConfig};
 use crate::resultset::{Resultset, collect_first_resultset, resultset_to_csv};
 use crate::sql::{is_read_only_query, is_tables_listing_query};
 
+pub use crate::pool::ConnectionManager;
+
 /// 连接池大小：stdio 单客户端场景，少量连接足够覆盖并发请求。
 const DB_POOL_MAX_SIZE: u32 = 4;
 
-/// 数据库连接池（bb8 + bb8-tiberius 管理客户端连接，按需复用）。
+/// 数据库连接池（bb8 管理自建的 [`ConnectionManager`]，见 [`crate::pool`]）。
 pub type DbPool = bb8::Pool<ConnectionManager>;
 
 /// 从应用配置构建 tiberius 连接配置。

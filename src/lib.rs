@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod db;
+pub mod pool;
 pub mod resultset;
 pub mod server;
 pub mod sql;
