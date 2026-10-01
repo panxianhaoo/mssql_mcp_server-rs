@@ -165,9 +165,19 @@ async fn describe_columns(
 
 /// 构造列结构查询 SQL：`schema` 为 `Some` 时附加 `TABLE_SCHEMA = @P2` 过滤。
 ///
+/// 输出 9 列，依次为：`TABLE_SCHEMA`、`COLUMN_NAME`、`DATA_TYPE`、`IS_NULLABLE`、
+/// `CHARACTER_MAXIMUM_LENGTH`、`NUMERIC_PRECISION`、`NUMERIC_SCALE`、`COLUMN_DEFAULT`、
+/// `COLLATION_NAME`。
+///
+/// 选列依据：`COLLATION_NAME` 携带排序/比较语义，且 SQL Server 支持**列级**
+/// collation（同一张表可混用不同规则），因此必须逐列输出；它放在最末以降低
+/// 对既有「按位置」消费者的影响。
+/// 反之不选 `CHARACTER_SET_NAME` —— nvarchar/ntext/sysname 恒为 `UNICODE`、
+/// varchar/text 恒为 `iso_1`，完全可由 `DATA_TYPE` 推出，属冗余列。
 fn columns_query(schema: Option<&str>) -> String {
     const SELECT_FROM: &str = "SELECT TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, \
-         CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT \
+         CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT, \
+         COLLATION_NAME \
          FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1";
     const ORDER_BY: &str = " ORDER BY ORDINAL_POSITION";
     match schema {
@@ -303,6 +313,52 @@ mod tests {
             assert!(sql.contains("ic.key_ordinal AS KEY_ORDINAL"));
             assert!(sql.contains("IS_INCLUDED_COLUMN"));
         }
+    }
+
+    #[test]
+    fn columns_query_selects_collation_last() {
+        // 回归点：COLLATION_NAME 必须存在且位于最末（见 columns_query 的选列说明）。
+        for sql in [columns_query(None), columns_query(Some("dbo"))] {
+            assert!(
+                sql.contains("COLLATION_NAME"),
+                "collation column missing: {sql}"
+            );
+            // CHARACTER_SET_NAME 是冗余列，不应出现在结果里。
+            assert!(
+                !sql.contains("CHARACTER_SET_NAME"),
+                "character set is derivable from DATA_TYPE: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn columns_query_columns_in_stable_order() {
+        let sql = columns_query(None);
+        let expected = [
+            "TABLE_SCHEMA",
+            "COLUMN_NAME",
+            "DATA_TYPE",
+            "IS_NULLABLE",
+            "CHARACTER_MAXIMUM_LENGTH",
+            "NUMERIC_PRECISION",
+            "NUMERIC_SCALE",
+            "COLUMN_DEFAULT",
+            "COLLATION_NAME",
+        ];
+        let positions: Vec<usize> = expected
+            .iter()
+            .map(|c| sql.find(c).unwrap_or_else(|| panic!("{c} missing: {sql}")))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "columns must appear in order: {expected:?} -> {positions:?}"
+        );
+    }
+
+    #[test]
+    fn columns_query_with_schema_filters_by_schema() {
+        assert!(columns_query(Some("dbo")).contains("AND TABLE_SCHEMA = @P2"));
+        assert!(!columns_query(None).contains("@P2"));
     }
 
     #[test]
