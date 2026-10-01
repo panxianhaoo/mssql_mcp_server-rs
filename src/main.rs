@@ -1,13 +1,9 @@
-//! mssql_mcp_server-rs：基于官方 Rust MCP SDK 的 Microsoft SQL Server MCP 服务器。
+//! mssql_mcp_server-rs 的可执行入口：通过 stdio 提供 JSON-RPC。
 //!
-//! 通过 stdio 提供 JSON-RPC，工具：`execute_sql`；资源：`mssql://{table}/data`。
+//! MCP 工具：`execute_sql`、`describe_table`；资源：`mssql://{table}/data`。
 
-mod config;
-mod db;
-mod server;
-mod sql;
-mod values;
-
+use mssql_mcp_server_rs::config;
+use mssql_mcp_server_rs::server::McpServer;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -40,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         db_config.is_azure()
     );
 
-    let service = server::McpServer::new(db_config).serve(stdio()).await?;
+    let service = McpServer::new(db_config).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

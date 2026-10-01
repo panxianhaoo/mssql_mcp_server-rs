@@ -28,3 +28,5 @@ tiberius = { version = "0.12", default-features = false, features = ["winauth"] 
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# 集成测试用真正的 CSV 解析器校验输出，而不是靠肉眼比对字符串。
+csv = "1"

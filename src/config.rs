@@ -20,7 +20,7 @@ pub enum AuthKind {
 
 impl AuthKind {
     /// 日志用的人类可读描述（绝不包含密码）。
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         match self {
             Self::SqlServer { user, .. } => format!("{user} (SQL login)"),
             #[cfg(windows)]
@@ -51,19 +51,33 @@ impl DbConfig {
     /// 从环境变量构建配置，缺失必填项或取值非法时返回带明确提示的错误。
     /// Windows 集成认证（`MSSQL_AUTH=windows`）不需要用户名与密码。
     pub fn from_env() -> Result<Self> {
-        let server = env::var("MSSQL_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string());
-        let database = required("MSSQL_DATABASE")?;
-        let mode = parse_auth_mode(env::var("MSSQL_AUTH").ok().as_deref())?;
+        Self::from_lookup(&|name| env::var(name).ok())
+    }
+
+    /// 解析配置的通用入口：`lookup` 按键名返回变量值（`None` = 未设置）。
+    ///
+    /// 把「读取来源」与「解析逻辑」解耦：进程环境变量只是一种来源，测试可注入
+    /// 任意来源。这样既不必在多线程测试里改写全局 env（Edition 2024 起
+    /// `env::set_var` 为 `unsafe`，且并行测试会互相污染），也让全部配置分支
+    /// 可在任何平台上被覆盖。
+    fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
+        // 空字符串视为未设置（与 MSSQL_PORT/MSSQL_AUTH 的处理保持一致）。
+        let server = lookup("MSSQL_SERVER")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+        let database = required(lookup, "MSSQL_DATABASE")?;
+        let mode = parse_auth_mode(lookup("MSSQL_AUTH").as_deref())?;
         let auth = match mode {
             AuthMode::Sql => AuthKind::SqlServer {
-                user: required("MSSQL_USER")?,
-                password: required("MSSQL_PASSWORD")?,
+                user: required(lookup, "MSSQL_USER")?,
+                password: required(lookup, "MSSQL_PASSWORD")?,
             },
             #[cfg(windows)]
             AuthMode::Windows => AuthKind::WindowsIntegrated,
         };
-        let port = parse_port(env::var("MSSQL_PORT").ok().as_deref())?;
-        let encrypt = parse_bool(env::var("MSSQL_ENCRYPT").ok().as_deref());
+        let port = parse_port(lookup("MSSQL_PORT").as_deref())?;
+        let encrypt = parse_bool(lookup("MSSQL_ENCRYPT").as_deref());
         Ok(Self::build(server, port, database, auth, encrypt))
     }
 
@@ -90,8 +104,9 @@ impl DbConfig {
     }
 }
 
-fn required(name: &str) -> Result<String> {
-    env::var(name).with_context(|| {
+/// 读取必填变量，缺失时返回带变量名的明确错误。
+fn required(lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<String> {
+    lookup(name).with_context(|| {
         format!(
             "Missing required database configuration: {name}. \
              MSSQL_USER, MSSQL_PASSWORD, and MSSQL_DATABASE are required"
@@ -154,6 +169,29 @@ fn windows_auth_mode() -> Result<AuthMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 由 `(key, value)` 列表构造变量查找函数：不触碰进程全局 env，
+    /// 因此测试互不干扰、可安全并行执行。
+    fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        // 转为自有数据，闭包无需借用入参（省去生命周期标注）。
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name| {
+            owned
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// 常见的最小可用配置：MSSQL_DATABASE + SQL 登录凭据。
+    const MINIMAL_PAIRS: &[(&str, &str)] = &[
+        ("MSSQL_DATABASE", "testdb"),
+        ("MSSQL_USER", "sa"),
+        ("MSSQL_PASSWORD", "pass"),
+    ];
 
     fn build_config(server: &str, encrypt_env: bool) -> DbConfig {
         DbConfig::build(
@@ -222,6 +260,131 @@ mod tests {
         assert_eq!(parse_auth_mode(Some(" SQL ")).unwrap(), AuthMode::Sql);
     }
 
+    #[test]
+    fn parse_auth_mode_rejects_unknown_values() {
+        assert!(parse_auth_mode(Some("ntlm")).is_err());
+        assert!(parse_auth_mode(Some("ldap")).is_err());
+    }
+
+    #[test]
+    fn describe_never_leaks_password() {
+        let auth = AuthKind::SqlServer {
+            user: "sa".to_string(),
+            password: "secret".to_string(),
+        };
+        assert_eq!(auth.describe(), "sa (SQL login)");
+    }
+
+    #[test]
+    fn from_lookup_builds_config_from_injected_source() {
+        let config = DbConfig::from_lookup(&lookup_from(MINIMAL_PAIRS)).unwrap();
+        assert_eq!(config.database, "testdb");
+        assert_eq!(
+            config.auth,
+            AuthKind::SqlServer {
+                user: "sa".to_string(),
+                password: "pass".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn from_lookup_defaults_server_and_port() {
+        let config = DbConfig::from_lookup(&lookup_from(MINIMAL_PAIRS)).unwrap();
+        assert_eq!(config.server, DEFAULT_SERVER);
+        assert_eq!(config.port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn from_lookup_reads_server_port_and_encrypt() {
+        let pairs = &[
+            ("MSSQL_SERVER", "dbhost"),
+            ("MSSQL_PORT", "1435"),
+            ("MSSQL_DATABASE", "proddb"),
+            ("MSSQL_USER", "app"),
+            ("MSSQL_PASSWORD", "secret"),
+            ("MSSQL_ENCRYPT", "true"),
+        ];
+        let config = DbConfig::from_lookup(&lookup_from(pairs)).unwrap();
+        assert_eq!(config.server, "dbhost");
+        assert_eq!(config.port, 1435);
+        assert_eq!(config.database, "proddb");
+        assert!(config.encrypt);
+        assert!(!config.is_azure());
+    }
+
+    #[test]
+    fn from_lookup_rejects_missing_required_variables() {
+        // 逐个摘掉必填变量，每个都应报错且错误里点名缺失的变量。
+        for missing in ["MSSQL_DATABASE", "MSSQL_USER", "MSSQL_PASSWORD"] {
+            let pairs: Vec<(&str, &str)> = MINIMAL_PAIRS
+                .iter()
+                .filter(|(k, _)| *k != missing)
+                .copied()
+                .collect();
+            let err = DbConfig::from_lookup(&lookup_from(&pairs)).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(missing),
+                "error should name {missing}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_lookup_rejects_invalid_port() {
+        let pairs = &[
+            ("MSSQL_DATABASE", "testdb"),
+            ("MSSQL_USER", "sa"),
+            ("MSSQL_PASSWORD", "pass"),
+            ("MSSQL_PORT", "abc"),
+        ];
+        let err = DbConfig::from_lookup(&lookup_from(pairs)).unwrap_err();
+        assert!(format!("{err:#}").contains("Invalid MSSQL_PORT"));
+    }
+
+    #[test]
+    fn from_lookup_propagates_invalid_auth_mode() {
+        let pairs = &[
+            ("MSSQL_DATABASE", "testdb"),
+            ("MSSQL_USER", "sa"),
+            ("MSSQL_PASSWORD", "pass"),
+            ("MSSQL_AUTH", "kerberos"),
+        ];
+        assert!(DbConfig::from_lookup(&lookup_from(pairs)).is_err());
+    }
+
+    #[test]
+    fn from_lookup_accepts_explicit_sql_mode() {
+        let pairs = &[
+            ("MSSQL_DATABASE", "testdb"),
+            ("MSSQL_USER", "sa"),
+            ("MSSQL_PASSWORD", "pass"),
+            ("MSSQL_AUTH", "sql"),
+        ];
+        let config = DbConfig::from_lookup(&lookup_from(pairs)).unwrap();
+        assert_eq!(
+            config.auth,
+            AuthKind::SqlServer {
+                user: "sa".to_string(),
+                password: "pass".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn from_lookup_treats_empty_server_as_unset() {
+        // 空字符串变量视为未设置：回落到 localhost 而非连向空主机。
+        let pairs = &[
+            ("MSSQL_SERVER", ""),
+            ("MSSQL_DATABASE", "testdb"),
+            ("MSSQL_USER", "sa"),
+            ("MSSQL_PASSWORD", "pass"),
+        ];
+        let config = DbConfig::from_lookup(&lookup_from(pairs)).unwrap();
+        assert_eq!(config.server, "localhost");
+    }
+
     #[cfg(windows)]
     #[test]
     fn parse_auth_mode_accepts_windows_on_windows() {
@@ -245,12 +408,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_auth_mode_rejects_unknown_values() {
-        assert!(parse_auth_mode(Some("ntlm")).is_err());
-        assert!(parse_auth_mode(Some("ldap")).is_err());
-    }
-
     #[cfg(windows)]
     #[test]
     fn build_supports_windows_integrated_auth() {
@@ -270,35 +427,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn from_env_windows_mode_does_not_require_credentials() {
-        unsafe {
-            env::set_var("MSSQL_DATABASE", "testdb");
-            env::set_var("MSSQL_AUTH", "windows");
-            env::remove_var("MSSQL_USER");
-            env::remove_var("MSSQL_PASSWORD");
-        }
-        let config = DbConfig::from_env().unwrap();
+    fn from_lookup_windows_mode_does_not_require_credentials() {
+        // 无 MSSQL_USER / MSSQL_PASSWORD：集成认证用当前登录用户身份。
+        let pairs = &[("MSSQL_DATABASE", "testdb"), ("MSSQL_AUTH", "windows")];
+        let config = DbConfig::from_lookup(&lookup_from(pairs)).unwrap();
         assert_eq!(config.auth, AuthKind::WindowsIntegrated);
+        assert_eq!(config.database, "testdb");
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn from_env_rejects_windows_mode_off_windows() {
-        unsafe {
-            env::set_var("MSSQL_DATABASE", "testdb");
-            env::set_var("MSSQL_AUTH", "windows");
-            env::remove_var("MSSQL_USER");
-            env::remove_var("MSSQL_PASSWORD");
-        }
-        assert!(DbConfig::from_env().is_err());
-    }
-
-    #[test]
-    fn describe_never_leaks_password() {
-        let auth = AuthKind::SqlServer {
-            user: "sa".to_string(),
-            password: "secret".to_string(),
-        };
-        assert_eq!(auth.describe(), "sa (SQL login)");
+    fn from_lookup_rejects_windows_mode_off_windows() {
+        // 非 Windows 平台启动即报错，避免留到连接阶段才失败。
+        let pairs = &[("MSSQL_DATABASE", "testdb"), ("MSSQL_AUTH", "windows")];
+        let err = DbConfig::from_lookup(&lookup_from(pairs)).unwrap_err();
+        assert!(format!("{err:#}").contains("only supported when running on Windows"));
     }
 }
