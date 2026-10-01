@@ -167,6 +167,20 @@ docker compose down        # 加 -v 连同数据卷删除
 含逗号与引号的数据行），互不干扰，因此既无需预置 schema、也可并行执行，
 重复运行结果稳定。CI 在 Linux runner 上跑同样这组用例。
 
+### 手动探索用的种子数据
+
+想在本地用 MCP 客户端随便点点，可以灌一份覆盖面较广的样例库（各类标量类型、
+NULL、中文与特殊字符、复合主键、INCLUDE 索引、外键、视图、列级 collation）：
+
+```bash
+docker compose up -d --wait
+docker cp scripts/seed-test-db.sql mssql-test:/seed.sql
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P 'YourStrong!Passw0rd' -C -i /seed.sql
+```
+
+脚本幂等，可重复执行；容器与数据卷保留，测试完无需删除。
+
 ## License
 
 MIT

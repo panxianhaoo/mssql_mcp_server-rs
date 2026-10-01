@@ -148,6 +148,23 @@ indexes with included columns, rows containing commas and quotes), so nothing is
 no schema setup is required, tests run safely in parallel, and repeated runs give stable
 results. CI runs the same suite on a Linux runner.
 
+### Seed data for manual exploration
+
+To poke at the server from an MCP client, load a sample database covering a
+wide range of shapes (scalar types, NULLs, Chinese and special characters,
+composite primary keys, INCLUDE indexes, foreign keys, views, per-column
+collation):
+
+```bash
+docker compose up -d --wait
+docker cp scripts/seed-test-db.sql mssql-test:/seed.sql
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P 'YourStrong!Passw0rd' -C -i /seed.sql
+```
+
+The script is idempotent; the container and its volume are kept around, so
+there is nothing to clean up afterwards.
+
 The code is organized as a library crate (`src/lib.rs`) plus a thin binary (`src/main.rs`),
 which is what allows `tests/integration.rs` to call the `db`/`config` modules directly.
 
