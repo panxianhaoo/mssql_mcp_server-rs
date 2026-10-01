@@ -1,0 +1,39 @@
+# 本地开发与 CI 共用的 SQL Server 测试实例。
+#
+# 启动：
+#   docker compose up -d --wait   # --wait 会等到 healthcheck 通过
+#   cargo test --test integration -- --ignored
+# 停止：
+#   docker compose down           # 加 -v 可连同数据卷一起删除
+#
+# 端口用 14333 而非 1433，避免与宿主机可能存在的其他 SQL Server 冲突。
+# 若你此前手动 `docker run` 过同名容器，请先 `docker stop/rm mssql-test`，
+# 否则会因容器名或端口占用而启动失败。
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql-test
+    # 健康检查：用镜像自带的 sqlcmd 探活，确保 cargo test 开始前实例已就绪。
+    # -C 表示信任服务器证书（本地自签够用）。
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-YourStrong!Passw0rd}"
+      MSSQL_PID: Developer
+    ports:
+      - "14333:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+
+volumes:
+  mssql-data:
