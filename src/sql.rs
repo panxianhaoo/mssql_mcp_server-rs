@@ -63,32 +63,68 @@ fn strip_line_comments(input: &str) -> String {
         .join("\n")
 }
 
+/// 去掉 `--` 与 `/* */` 注释后的 SQL 文本。
+fn strip_comments(query: &str) -> String {
+    strip_line_comments(&strip_block_comments(query))
+}
+
 /// 判断查询是否为 SELECT 语句，正确处理 `--` 与 `/* */` 注释。
 pub fn is_select_query(query: &str) -> bool {
-    let cleaned = strip_line_comments(&strip_block_comments(query));
-    cleaned
+    strip_comments(query)
         .split_whitespace()
         .next()
         .is_some_and(|word| word.eq_ignore_ascii_case("select"))
 }
 
 /// 判断查询是否为对 `INFORMATION_SCHEMA.TABLES` 的查询（输出格式特判）。
+///
+/// 匹配必须基于**去掉注释后**的文本：否则一条普通查询只要注释里提到
+/// `INFORMATION_SCHEMA.TABLES`，就会被误判成表清单查询而输出 mysql 风格的
+/// `Tables_in_{database}` 表头，丢掉真正的列名。
 pub fn is_tables_listing_query(query: &str) -> bool {
-    is_select_query(query)
-        && query
+    let cleaned = strip_comments(query);
+    is_select_query(&cleaned)
+        && cleaned
             .to_ascii_uppercase()
             .contains("INFORMATION_SCHEMA.TABLES")
 }
 
 /// 判断语句是否为只读查询：单条语句，且顶层语句为 `SELECT`，
-/// 或 `WITH name [(列)] AS (子查询) [, ...] SELECT ...` 形式的 CTE 查询。
+/// 或 `WITH name [(列)] AS (子查询) [, ...] SELECT ...` 形式的 CTE 查询，
+/// 且不含写入型语法（见 [`has_write_side_effect`]）。
 ///
 /// 只读保护的核心：INSERT/UPDATE/DELETE/DDL/EXEC 等修改语句、
 /// 多语句批次（`;` 之后还有内容）、以及藏在字符串/注释里的分号
 /// 都会被正确识别并拒绝。
 pub fn is_read_only_query(query: &str) -> bool {
     let tokens = tokenize(query);
-    !has_multiple_statements(&tokens) && starts_with_read_only_statement(&tokens)
+    !has_multiple_statements(&tokens)
+        && starts_with_read_only_statement(&tokens)
+        && !has_write_side_effect(&tokens)
+}
+
+/// 识别「语法上是 SELECT、实际会写入」的语句。
+///
+/// 仅看首关键字会把下面两类放行，它们都真的改了数据库：
+///
+/// - `SELECT ... INTO <新表> FROM ...`：建表并插入数据（DDL + DML）。
+///   这里拒绝**任何** `INTO` 词元——T-SQL 中 `INTO` 只出现在 `SELECT INTO`
+///   与 `INSERT INTO` 两种写入语法里，不存在只读用法，故无需判断括号深度。
+///   字符串与 `[...]` 括起标识符已被词法分析折叠成 [`Token::Opaque`]，
+///   因此 `SELECT 'into' AS x`、`SELECT [into] FROM t` 不会误伤。
+/// - `SELECT NEXT VALUE FOR <序列>`：**推进**序列对象，是带副作用的读。
+///   三连词 `next value for` 无歧义，不存在只读用法。
+fn has_write_side_effect(tokens: &[Token]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(token, Token::Ident(word) if word == "into"))
+        || tokens.windows(3).any(|window| {
+            matches!(
+                window,
+                [Token::Ident(a), Token::Ident(b), Token::Ident(c)]
+                    if a == "next" && b == "value" && c == "for"
+            )
+        })
 }
 
 /// 词法单元：只保留判断语句结构所需的类别。
@@ -422,6 +458,82 @@ mod tests {
         // 字符串里的注释开头不能掩盖后续语句
         assert!(!is_read_only_query("SELECT '/*'; DROP TABLE x"));
         assert!(!is_read_only_query("SELECT '--'; DROP TABLE x"));
+    }
+
+    #[test]
+    fn is_read_only_query_rejects_select_into() {
+        // 回归点：`SELECT ... INTO` 是 DDL + DML（建表并写入），
+        // 首关键字是 SELECT 因此此前被放行——实际上完全绕过了只读保护。
+        for query in [
+            "SELECT * INTO archive FROM users",
+            "select id into #tmp from users",
+            "SELECT * INTO sales.orders_backup FROM sales.orders",
+            // CTE 之后接 SELECT INTO 同样要拦住
+            "WITH c AS (SELECT * FROM users) SELECT * INTO copied FROM c",
+        ] {
+            assert!(!is_read_only_query(query), "should reject: {query}");
+        }
+    }
+
+    #[test]
+    fn is_read_only_query_rejects_next_value_for() {
+        // `NEXT VALUE FOR` 会推进序列对象，是带副作用的读。
+        assert!(!is_read_only_query("SELECT NEXT VALUE FOR dbo.order_seq"));
+        assert!(!is_read_only_query(
+            "SELECT NEXT VALUE FOR dbo.order_seq AS id, name FROM users"
+        ));
+    }
+
+    #[test]
+    fn is_read_only_query_allows_into_in_literals_and_identifiers() {
+        // 回归点：拒绝 INTO 不能误伤字符串/括起标识符/列名里的这个词。
+        for query in [
+            "SELECT 'into' AS note",
+            "SELECT [into] FROM t",
+            "SELECT * FROM t WHERE note = 'take into account'",
+        ] {
+            assert!(is_read_only_query(query), "should allow: {query}");
+        }
+    }
+
+    #[test]
+    fn is_read_only_query_still_allows_plain_selects() {
+        // 防过度拦截：加了新的拒绝规则后，常规 SELECT 必须仍然通过。
+        for query in [
+            "SELECT * FROM users",
+            "SELECT TOP 100 * FROM [dbo].[users];",
+            "WITH t AS (SELECT 1 AS x) SELECT * FROM t",
+            "SELECT COUNT(*) FROM users WHERE region = 'East'",
+            // `INTO` 不作为独立词元出现的普通查询
+            "SELECT * FROM information_schema.tables",
+        ] {
+            assert!(is_read_only_query(query), "should allow: {query}");
+        }
+    }
+
+    #[test]
+    fn is_tables_listing_query_ignores_mentions_in_comments() {
+        // 回归点：此前用未清洗文本匹配，注释里提到就误触发 mysql 风格表头。
+        assert!(!is_tables_listing_query(
+            "SELECT 1 -- INFORMATION_SCHEMA.TABLES mentioned here"
+        ));
+        assert!(!is_tables_listing_query(
+            "SELECT 1 /* INFORMATION_SCHEMA.TABLES */"
+        ));
+        assert!(!is_tables_listing_query(
+            "-- INFORMATION_SCHEMA.TABLES\nSELECT 1"
+        ));
+    }
+
+    #[test]
+    fn is_tables_listing_query_still_detects_real_queries() {
+        assert!(is_tables_listing_query(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"
+        ));
+        assert!(is_tables_listing_query(
+            "select * from information_schema.tables"
+        ));
+        assert!(!is_tables_listing_query("SELECT * FROM users"));
     }
 
     #[test]

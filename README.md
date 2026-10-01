@@ -94,7 +94,7 @@ claude mcp add mssql -- ./path/to/mssql_mcp_server-rs \
 
 ## 注意事项
 
-- 只读保护：`execute_sql` 仅接受单条 SELECT 查询，修改语句在发送到数据库前即被拒绝；应用层白名单不能覆盖所有边界（如带副作用的函数），生产环境建议配合只读数据库账号
+- 只读保护：`execute_sql` 仅接受单条 SELECT 查询，修改语句在发送到数据库前即被拒绝；除了 INSERT/UPDATE/DELETE/DDL/EXEC 与多语句批次，也会拒绝语法上是 SELECT 但会写入的语句（`SELECT ... INTO` 建表写数据、`SELECT NEXT VALUE FOR` 推进序列）。应用层白名单不能覆盖所有边界（如带副作用的函数），生产环境建议配合只读数据库账号
 - Windows 集成认证（SSPI）：`MSSQL_AUTH=windows`，仅 Windows 平台可用（非 Windows 启动即报错）
 - 不支持 LocalDB 命名实例（仅 TCP 直连 host:port）
 
