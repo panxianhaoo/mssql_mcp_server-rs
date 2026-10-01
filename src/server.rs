@@ -1,19 +1,21 @@
-//! MCP server：提供只读的 `execute_sql` 工具、分页的表资源列表（`mssql://{table}/data`）。
+//! MCP server：只读工具（`execute_sql`、`describe_table`、`table_sizes`、
+//! `list_databases`）、分页的表资源列表（`mssql://{table}/data`）与资源模板。
 
 use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ServerCapabilities, ServerConfig,
+    CallToolResult, ContentBlock, Implementation, ListResourceTemplatesResult, ListResourcesResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::config::DbConfig;
-use crate::db::{self, DbPool};
+use crate::db::{self, DatabasePools, DbPool, DescribeSections};
+use crate::format::{OutputFormat, render_resultset};
 use crate::sql::{parse_table_name, validate_table_name};
 
 const MSSQL_URI_SCHEME: &str = "mssql://";
@@ -24,8 +26,14 @@ const RESOURCES_PAGE_SIZE: usize = 500;
 /// `execute_sql` 工具的入参。
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct ExecuteSqlArgs {
-    /// The SQL query to execute
+    /// The SQL query to execute (a single SELECT)
     query: String,
+    /// Output format: "csv" (default), "json", or "markdown"
+    #[serde(default)]
+    format: Option<String>,
+    /// Optional database to run against; defaults to MSSQL_DATABASE
+    #[serde(default)]
+    database: Option<String>,
 }
 
 /// `describe_table` 工具的入参。
@@ -33,13 +41,63 @@ struct ExecuteSqlArgs {
 struct DescribeTableArgs {
     /// The table or view name to describe (e.g. "users", "dbo.users", "active_users")
     table: String,
+    /// Include approximate row count and space usage (default: false)
+    #[serde(default)]
+    include_row_count: Option<bool>,
+    /// Include views that reference this table, with their definitions (default: false)
+    #[serde(default)]
+    include_dependent_views: Option<bool>,
+    /// Optional database to inspect; defaults to MSSQL_DATABASE
+    #[serde(default)]
+    database: Option<String>,
+}
+
+/// `table_sizes` 工具的入参。
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct TableSizesArgs {
+    /// Optional substring filter on table name or "schema.table"
+    #[serde(default)]
+    table: Option<String>,
+    /// Output format: "csv" (default), "json", or "markdown"
+    #[serde(default)]
+    format: Option<String>,
+    /// Optional database to inspect; defaults to MSSQL_DATABASE
+    #[serde(default)]
+    database: Option<String>,
+}
+
+/// `list_databases` 工具的入参。
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ListDatabasesArgs {
+    /// Output format: "csv" (default), "json", or "markdown"
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// 解析工具入参里的输出格式；非法值返回可直接展示给模型的错误。
+fn resolve_format(value: Option<&str>) -> Result<OutputFormat, McpError> {
+    OutputFormat::parse(value).ok_or_else(|| {
+        McpError::invalid_params(
+            format!(
+                "Invalid format: {}. Expected 'csv', 'json', or 'markdown'",
+                value.unwrap_or_default()
+            ),
+            None,
+        )
+    })
+}
+
+/// 归一化可选的数据库名：空字符串视为未指定。
+fn normalize_database(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|d| !d.is_empty())
 }
 
 #[derive(Clone)]
 pub struct McpServer {
     /// 数据库配置（连接池之外的少量信息，如 `Tables_in_{database}` 表头用的库名）。
     config: Arc<DbConfig>,
-    pool: DbPool,
+    /// 按库名缓存的连接池，支撑多数据库查询。
+    pools: DatabasePools,
     tool_router: ToolRouter<Self>,
 }
 
@@ -47,14 +105,25 @@ pub struct McpServer {
 impl McpServer {
     pub fn new(config: DbConfig) -> Self {
         Self {
-            config: Arc::new(config.clone()),
-            pool: db::new_pool(&config),
+            pools: DatabasePools::new(config.clone()),
+            config: Arc::new(config),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// 取目标数据库的连接池（`database` 为 `None` 时用默认库）。
+    fn pool(&self, database: Option<&str>) -> DbPool {
+        self.pools.pool(database)
+    }
+
     #[tool(
-        description = "Execute a read-only SQL query (a single SELECT; WITH ... SELECT is allowed) on the SQL Server"
+        description = "Execute a read-only SQL query (a single SELECT; WITH ... SELECT is allowed) on the SQL Server. Returns results as CSV (default), JSON, or Markdown.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn execute_sql(
         &self,
@@ -63,16 +132,37 @@ impl McpServer {
         if args.query.trim().is_empty() {
             return Err(McpError::invalid_params("Query is required", None));
         }
+        let format = resolve_format(args.format.as_deref())?;
+        let database = normalize_database(args.database.as_deref());
+        let pool = self.pool(database);
         // 数据库错误以文本形式返回（与参考实现一致），便于客户端读到失败原因。
-        let output = match db::execute_query(&self.pool, &self.config.database, &args.query).await {
+        // 用 is_error 标记让协议层也能区分成败，而不是一律 success。
+        let text = match db::execute_query(
+            &pool,
+            &self.database_name(database),
+            &args.query,
+            format,
+        )
+        .await
+        {
             Ok(text) => text,
-            Err(e) => format!("Error executing query: {e:#}"),
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error executing query: {e:#}"
+                ))]));
+            }
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
-        description = "Describe the structure of a SQL Server table or view (column names, types, nullability, length/precision, defaults, collation, indexes)"
+        description = "Describe the structure of a SQL Server table or view (column names, types, nullability, length/precision, defaults, collation, indexes). Optionally include row counts and dependent views.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn describe_table(
         &self,
@@ -83,12 +173,88 @@ impl McpServer {
         }
         let (schema, table) = parse_table_name(&args.table)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        // 数据库错误以文本形式返回（与 execute_sql 一致），便于客户端读到失败原因。
-        let output = match db::describe_table(&self.pool, schema.as_deref(), &table).await {
-            Ok(text) => text,
-            Err(e) => format!("Error describing table: {e:#}"),
+        let database = normalize_database(args.database.as_deref());
+        let sections = DescribeSections {
+            columns: true,
+            indexes: true,
+            row_count: args.include_row_count.unwrap_or(false),
+            dependent_views: args.include_dependent_views.unwrap_or(false),
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+        let pool = self.pool(database);
+        // 数据库错误以文本形式返回（与 execute_sql 一致），便于客户端读到失败原因。
+        let text = match db::describe_table(&pool, schema.as_deref(), &table, sections).await {
+            Ok(text) => text,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error describing table: {e:#}"
+                ))]));
+            }
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(
+        description = "Report approximate row counts and disk space usage for user tables, from metadata (no table scan). Optionally filter by table name substring.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn table_sizes(
+        &self,
+        Parameters(args): Parameters<TableSizesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let format = resolve_format(args.format.as_deref())?;
+        let database = normalize_database(args.database.as_deref());
+        let pool = self.pool(database);
+        let filter = args
+            .table
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let text = match db::list_table_sizes(&pool, filter).await {
+            Ok(resultset) => render_resultset(&resultset, format),
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error listing table sizes: {e:#}"
+                ))]));
+            }
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(
+        description = "List the databases on this SQL Server that are online and accessible to the current login.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_databases(
+        &self,
+        Parameters(args): Parameters<ListDatabasesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let format = resolve_format(args.format.as_deref())?;
+        let text = match db::list_databases(&self.pool(None)).await {
+            Ok(resultset) => render_resultset(&resultset, format),
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error listing databases: {e:#}"
+                ))]));
+            }
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    /// `Tables_in_{database}` 表头等场景需要的实际库名。
+    fn database_name(&self, database: Option<&str>) -> String {
+        database
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.database.clone())
     }
 }
 
@@ -108,6 +274,8 @@ impl ServerHandler for McpServer {
         .with_instructions(
             "MSSQL MCP server: use execute_sql to run read-only queries, \
              describe_table to inspect the structure of a table or view, \
+             table_sizes to check row counts and space usage, \
+             list_databases to discover databases, \
              or read mssql://{table}/data resources to peek at table or view contents.",
         )
     }
@@ -119,7 +287,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListResourcesResult, McpError> {
         let offset = decode_cursor(request.as_ref().and_then(|p| p.cursor.clone()))?;
         // 数据库不可达时返回空列表（与参考实现一致）。
-        let objects = match db::list_tables_and_views(&self.pool).await {
+        let objects = match db::list_tables_and_views(&self.pool(None)).await {
             Ok(objects) => objects,
             Err(e) => {
                 log::error!("Failed to list resources: {e:#}");
@@ -151,6 +319,22 @@ impl ServerHandler for McpServer {
         Ok(result)
     }
 
+    /// 声明 `mssql://{table}/data` 模板：客户端据此补全而非仅能枚举。
+    ///
+    /// 没有模板时，客户端只能先 `resources/list` 拿到全部具体 URI 才能读；
+    /// 有了模板，模型可直接拼出 `mssql://dbo.orders/data`。
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let template =
+            ResourceTemplate::new(format!("{MSSQL_URI_SCHEME}{{table}}/data"), "table_data")
+                .with_description("First 100 rows of a table or view, as CSV")
+                .with_mime_type("text/csv");
+        Ok(ListResourceTemplatesResult::with_all_items(vec![template]))
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -161,7 +345,7 @@ impl ServerHandler for McpServer {
             .ok_or_else(|| McpError::invalid_params(format!("Invalid URI scheme: {uri}"), None))?;
         let safe_table = validate_table_name(&table)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let contents = match db::read_table(&self.pool, &safe_table).await {
+        let contents = match db::read_table(&self.pool(None), &safe_table).await {
             Ok(text) => text,
             Err(e) => {
                 log::error!("Database error reading resource {uri}: {e:#}");
@@ -230,5 +414,34 @@ mod tests {
     fn parse_table_from_uri_rejects_other_schemes() {
         assert_eq!(parse_table_from_uri("file:///etc/passwd"), None);
         assert_eq!(parse_table_from_uri("mssql:///data"), None);
+    }
+
+    #[test]
+    fn resolve_format_defaults_to_csv() {
+        assert_eq!(resolve_format(None).unwrap(), OutputFormat::Csv);
+        assert_eq!(resolve_format(Some("")).unwrap(), OutputFormat::Csv);
+        assert_eq!(resolve_format(Some("json")).unwrap(), OutputFormat::Json);
+        assert_eq!(
+            resolve_format(Some("markdown")).unwrap(),
+            OutputFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn resolve_format_rejects_unknown() {
+        let err = resolve_format(Some("xml")).unwrap_err();
+        assert!(
+            err.message.contains("Invalid format"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn normalize_database_treats_blank_as_unset() {
+        assert_eq!(normalize_database(None), None);
+        assert_eq!(normalize_database(Some("")), None);
+        assert_eq!(normalize_database(Some("  ")), None);
+        assert_eq!(normalize_database(Some(" other ")), Some("other"));
     }
 }

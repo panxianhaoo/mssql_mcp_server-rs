@@ -4,7 +4,7 @@
 
 A Microsoft SQL Server MCP (Model Context Protocol) server, implemented in Rust.
 
-Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/rust-sdk) and the [tiberius](https://github.com/prisma/tiberius) TDS driver, serving JSON-RPC over stdio.
+Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/rust-sdk) and the [tiberius](https://github.com/prisma/tiberius) TDS driver, serving JSON-RPC over stdio (or streamable-http when built with the `http` feature).
 
 ## Features
 
@@ -20,7 +20,15 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
   - `COLLATION_NAME` reports the collation per column (SQL Server supports **column-level** collation, so one table may mix different rules); it is `NULL` for non-character types. Listed last to reduce impact on existing positional consumers
   - Without a schema qualifier, all schemas are matched and the result includes `TABLE_SCHEMA`/`OBJECT_SCHEMA` columns
   - Skip lines starting with `# ` and both sections can be fed to a standard CSV parser
+- **`format` parameter** (`execute_sql` / `table_sizes` / `list_databases`): output format `csv` (default), `json`, or `markdown`
+  - `json` emits an array of objects; values containing commas/quotes need no escaping to round-trip unambiguously. Values are always strings, preserving money fixed-point, hex binary, and other rendering semantics
+  - `markdown` emits a table, escaping `|` as `\|` and collapsing newlines to `<br>`
+- **Tool `table_sizes`**: reports row counts and disk usage for user tables, read from metadata (always O(1) — **no table scan**); optionally filter by table-name substring
+- **Tool `list_databases`**: lists databases on the server that are online and accessible to the current login, so you can discover databases before querying tables
+- **Multi-database**: `execute_sql` / `describe_table` / `table_sizes` accept a `database` parameter; each database gets its own lazily-created connection pool (rather than `USE` — that is connection-level state and leaks to the next borrower)
+- **Optional `describe_table` sections**: `include_row_count` (rows and space) and `include_dependent_views` (views referencing the table, with their definition SQL); off by default to preserve the existing two-section CSV layout
 - **Resource `mssql://{table}/data`**: one resource per user table/view, reading the first 100 rows; resource names distinguish `Table: x` / `View: x`; `resources/list` is cursor-paginated (max 500 items per page), keeping response size bounded on large catalogs
+  - Resource names carry the schema (`mssql://dbo.orders/data`) so cross-schema lookups don't silently fall back to the default schema
 - **Connection pool**: built-in bb8 pool (max 4 connections, `SELECT 1` liveness check on checkout), reusing connections instead of a TCP/TDS handshake per request
 
 ## Environment Variables

@@ -5,7 +5,8 @@
 Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现。
 
 基于官方 Rust SDK [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 与
-[tiberius](https://github.com/prisma/tiberius) TDS 驱动，通过 stdio 提供 JSON-RPC。
+[tiberius](https://github.com/prisma/tiberius) TDS 驱动，通过 stdio 提供 JSON-RPC
+（启用 `http` feature 后也可走 streamable-http）。
 
 ## 功能
 
@@ -21,7 +22,15 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
   - `COLLATION_NAME` 逐列给出排序规则（SQL Server 支持**列级** collation，同一张表可混用不同规则），非字符类型该列为 `NULL`；这一列放在最末，以降低对既有「按位置」消费者的影响
   - 不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列
   - 跳过 `# ` 开头的注释行后，两段均可交由标准 CSV 解析器读取
+- **`format` 参数**（`execute_sql` / `table_sizes` / `list_databases`）：输出格式可选 `csv`（默认）、`json`、`markdown`
+  - `json` 输出对象数组，含逗号/引号的值无需转义即可无歧义解析；值一律为字符串，以保留 money 定点、二进制十六进制等渲染语义
+  - `markdown` 输出表格，单元格内的 `|` 转义为 `\|`、换行折叠为 `<br>`
+- **工具 `table_sizes`**：报告用户表的行数与磁盘占用（取自元数据，恒 O(1)，**不扫表**）；可按表名子串过滤
+- **工具 `list_databases`**：列出服务器上的数据库（仅 ONLINE 且当前登录可访问），便于先发现库再查表
+- **多数据库**：`execute_sql` / `describe_table` / `table_sizes` 均可带 `database` 参数；每个库按需建独立连接池（不用 `USE` 切库——`USE` 是连接级状态，会泄漏给下一个借用者）
+- **`describe_table` 可选分节**：`include_row_count`（行数与空间）、`include_dependent_views`（引用该表的视图及其定义 SQL），默认关闭以保持既有「两段 CSV」格式
 - **资源 `mssql://{table}/data`**：每张用户表/视图一个资源，读取前 100 行；资源名称区分 `Table: x` / `View: x`；`resources/list` 按 cursor 分页（每页最多 500 条），大目录下响应体有界
+  - URI 中的表名带 schema（`mssql://dbo.orders/data`），避免跨 schema 落到默认 schema 读错表
 - **连接池**：内置 bb8 连接池（最多 4 个连接，借出前 `SELECT 1` 探活），复用连接省去每请求的 TCP/TDS 握手开销
 
 ## 环境变量

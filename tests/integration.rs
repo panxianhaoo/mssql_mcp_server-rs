@@ -20,8 +20,10 @@ use std::collections::BTreeSet;
 
 use mssql_mcp_server_rs::config::DbConfig;
 use mssql_mcp_server_rs::db::{
-    DbPool, describe_table, execute_query, list_tables_and_views, new_pool, read_table,
+    DbPool, DescribeSections, describe_table, execute_query, list_databases, list_table_sizes,
+    list_tables_and_views, new_pool, read_table,
 };
+use mssql_mcp_server_rs::format::OutputFormat;
 use mssql_mcp_server_rs::resultset::collect_first_resultset;
 use mssql_mcp_server_rs::sql::{is_read_only_query, validate_table_name};
 
@@ -157,7 +159,7 @@ fn parse_csv(text: &str) -> Vec<Vec<Vec<String>>> {
 #[ignore = "requires a live SQL Server"]
 async fn connection_pool_serves_simple_query() {
     let pool = test_pool();
-    let out = execute_query(&pool, "master", "SELECT 42 AS answer")
+    let out = execute_query(&pool, "master", "SELECT 42 AS answer", OutputFormat::Csv)
         .await
         .expect("SELECT must succeed against a live server");
     let sections = parse_csv(&out);
@@ -173,7 +175,7 @@ async fn csv_output_quotes_values_containing_delimiters() {
     let fx = setup_fixture(&pool, "csvquote").await;
     let query = format!("SELECT customer FROM dbo.{} ORDER BY id", fx.table);
     assert!(is_read_only_query(&query), "guard must accept this SELECT");
-    let out = execute_query(&pool, "master", &query)
+    let out = execute_query(&pool, "master", &query, OutputFormat::Csv)
         .await
         .expect("query must succeed");
     let rows = &parse_csv(&out)[0];
@@ -198,9 +200,14 @@ async fn describe_table_lists_composite_key_columns_as_separate_rows() {
     // 复合主键 (id, region) 必须输出两行，而不是 STRING_AGG 拼成的一行 "id,region"。
     let pool = test_pool();
     let fx = setup_fixture(&pool, "composite").await;
-    let out = describe_table(&pool, Some("dbo"), &fx.table)
-        .await
-        .expect("describe_table must succeed");
+    let out = describe_table(
+        &pool,
+        Some("dbo"),
+        &fx.table,
+        DescribeSections::default_sections(),
+    )
+    .await
+    .expect("describe_table must succeed");
     let sections = parse_csv(&out);
     assert_eq!(sections.len(), 2, "expected columns + INDEXES sections");
     let index_rows = &sections[1];
@@ -241,7 +248,7 @@ async fn describe_table_includes_included_columns_as_rows() {
     // INCLUDE (amount) 应作为独立行出现，且 IS_INCLUDED_COLUMN=YES。
     let pool = test_pool();
     let fx = setup_fixture(&pool, "include").await;
-    let out = describe_table(&pool, None, &fx.table)
+    let out = describe_table(&pool, None, &fx.table, DescribeSections::default_sections())
         .await
         .expect("describe_table must succeed");
     let rows = &parse_csv(&out)[1];
@@ -272,9 +279,14 @@ async fn describe_table_includes_included_columns_as_rows() {
 async fn describe_table_works_for_views() {
     let pool = test_pool();
     let fx = setup_fixture(&pool, "viewprobe").await;
-    let out = describe_table(&pool, Some("dbo"), &fx.view)
-        .await
-        .expect("describe_table must handle views");
+    let out = describe_table(
+        &pool,
+        Some("dbo"),
+        &fx.view,
+        DescribeSections::default_sections(),
+    )
+    .await
+    .expect("describe_table must handle views");
     let rows = &parse_csv(&out)[0];
     // 视图的列：id、region（顺序同 SELECT 列表）。
     let cols: Vec<&str> = rows[1..].iter().map(|r| r[1].as_str()).collect();
@@ -306,9 +318,14 @@ async fn describe_table_reports_per_column_collation() {
     )
     .await;
 
-    let out = describe_table(&pool, Some("dbo"), table)
-        .await
-        .expect("describe_table must succeed");
+    let out = describe_table(
+        &pool,
+        Some("dbo"),
+        table,
+        DescribeSections::default_sections(),
+    )
+    .await
+    .expect("describe_table must succeed");
     let rows = &parse_csv(&out)[0];
     let header = &rows[0];
     let collation_pos = header
@@ -345,9 +362,14 @@ async fn describe_table_reports_per_column_collation() {
 #[ignore = "requires a live SQL Server"]
 async fn describe_table_rejects_unknown_table() {
     let pool = test_pool();
-    let err = describe_table(&pool, Some("dbo"), "no_such_table_exists_here")
-        .await
-        .expect_err("unknown table must be reported as an error");
+    let err = describe_table(
+        &pool,
+        Some("dbo"),
+        "no_such_table_exists_here",
+        DescribeSections::default_sections(),
+    )
+    .await
+    .expect_err("unknown table must be reported as an error");
     assert!(
         format!("{err:#}").contains("No columns found"),
         "unexpected error: {err:#}"
@@ -374,26 +396,29 @@ async fn read_table_returns_csv_header_and_rows() {
 async fn list_tables_and_views_reports_both_kinds() {
     let pool = test_pool();
     let fx = setup_fixture(&pool, "listkinds").await;
+    // 清单里的名字是 schema 限定的（`dbo.mcp_it_listkinds`，见
+    // `list_tables_and_views` 的文档），故拼接后再比对。
+    let qualified = |name: &str| format!("dbo.{name}");
     let objects = list_tables_and_views(&pool)
         .await
         .expect("listing must succeed");
     let table_names: BTreeSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
     assert!(
-        table_names.contains(fx.table.as_str()),
+        table_names.contains(qualified(&fx.table).as_str()),
         "fixture table missing from listing: {table_names:?}"
     );
     assert!(
-        table_names.contains(fx.view.as_str()),
+        table_names.contains(qualified(&fx.view).as_str()),
         "fixture view missing from listing: {table_names:?}"
     );
     let view = objects
         .iter()
-        .find(|o| o.name == fx.view)
+        .find(|o| o.name == qualified(&fx.view))
         .expect("view row");
     assert_eq!(view.kind.label(), "View");
     let table = objects
         .iter()
-        .find(|o| o.name == fx.table)
+        .find(|o| o.name == qualified(&fx.table))
         .expect("table row");
     assert_eq!(table.kind.label(), "Table");
     teardown_fixture(&pool, &fx).await;
@@ -432,7 +457,7 @@ async fn read_only_guard_rejects_writes_before_hitting_server() {
         "UPDATE mcp_it_guardprobe SET id = 2",
         "TRUNCATE TABLE mcp_it_guardprobe",
     ] {
-        let err = execute_query(&pool, "master", dangerous)
+        let err = execute_query(&pool, "master", dangerous, OutputFormat::Csv)
             .await
             .expect_err("write statements must be rejected");
         assert!(
@@ -451,7 +476,7 @@ async fn execute_query_accepts_cte_select() {
         "WITH ranked AS (SELECT id, region FROM dbo.{}) SELECT * FROM ranked ORDER BY id",
         fx.table
     );
-    let out = execute_query(&pool, "master", &query)
+    let out = execute_query(&pool, "master", &query, OutputFormat::Csv)
         .await
         .expect("CTE SELECT must be allowed and succeed");
     assert!(out.contains("id,region"), "expected CSV header: {out}");
@@ -467,6 +492,7 @@ async fn tables_listing_query_uses_mysql_style_header() {
         &pool,
         "mydb",
         "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'",
+        OutputFormat::Csv,
     )
     .await
     .expect("INFORMATION_SCHEMA query must succeed");
@@ -474,4 +500,218 @@ async fn tables_listing_query_uses_mysql_style_header() {
         out.lines().next().unwrap_or_default() == "Tables_in_mydb",
         "expected Tables_in_ header, got: {out}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 新增功能：视图定义、表规模、多数据库、输出格式
+// ---------------------------------------------------------------------------
+
+/// 视图定义必须能被取回：LLM 靠它理解视图的聚合逻辑，否则会重复实现。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn describe_table_can_include_dependent_views() {
+    let pool = test_pool();
+    let fx = setup_fixture(&pool, "depviews").await;
+    let sections = DescribeSections {
+        columns: true,
+        indexes: true,
+        row_count: false,
+        dependent_views: true,
+    };
+    let out = describe_table(&pool, Some("dbo"), &fx.table, sections)
+        .await
+        .expect("describe_table with dependent views must succeed");
+    // 夹具创建的视图 `mcp_it_depviews_v` 引用了该表，应出现在 DEPENDENT_VIEWS 段。
+    assert!(
+        out.contains("# DEPENDENT_VIEWS"),
+        "expected DEPENDENT_VIEWS section: {out}"
+    );
+    assert!(
+        out.contains(fx.view.as_str()),
+        "view {view} must be listed: {out}",
+        view = fx.view
+    );
+    // 视图定义里含 SELECT，证明确实取到了 SQL 文本而非只有名字。
+    assert!(
+        out.to_ascii_uppercase().contains("SELECT"),
+        "expected view definition SQL: {out}"
+    );
+    teardown_fixture(&pool, &fx).await;
+}
+
+/// 默认分节不应包含 DEPENDENT_VIEWS（向后兼容既有「两段 CSV」消费者）。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn describe_table_default_sections_omit_optional_parts() {
+    let pool = test_pool();
+    let fx = setup_fixture(&pool, "defaultsect").await;
+    let out = describe_table(
+        &pool,
+        Some("dbo"),
+        &fx.table,
+        DescribeSections::default_sections(),
+    )
+    .await
+    .expect("describe_table must succeed");
+    assert!(
+        !out.contains("# DEPENDENT_VIEWS"),
+        "default must not add DEPENDENT_VIEWS: {out}"
+    );
+    assert!(
+        !out.contains("# ROW_COUNT"),
+        "default must not add ROW_COUNT: {out}"
+    );
+    assert!(out.contains("# INDEXES"), "default keeps INDEXES: {out}");
+    teardown_fixture(&pool, &fx).await;
+}
+
+/// ROW_COUNT 分节必须给出行数（夹具插入了 2 行）。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn describe_table_can_include_row_count() {
+    let pool = test_pool();
+    let fx = setup_fixture(&pool, "rowcount").await;
+    let sections = DescribeSections {
+        columns: true,
+        indexes: false,
+        row_count: true,
+        dependent_views: false,
+    };
+    let out = describe_table(&pool, Some("dbo"), &fx.table, sections)
+        .await
+        .expect("describe_table with row count must succeed");
+    assert!(out.contains("# ROW_COUNT"), "expected ROW_COUNT: {out}");
+    let sections_csv = parse_csv(&out);
+    let sizes = sections_csv
+        .iter()
+        .find(|rows| rows[0].contains(&"ROW_COUNT".to_string()))
+        .unwrap_or_else(|| panic!("ROW_COUNT section missing: {out}"));
+    let row_pos = sizes[0]
+        .iter()
+        .position(|h| h == "ROW_COUNT")
+        .expect("ROW_COUNT column");
+    let counted: u32 = sizes[1][row_pos].parse().expect("row count is numeric");
+    assert_eq!(counted, 2, "fixture inserted 2 rows: {out}");
+    teardown_fixture(&pool, &fx).await;
+}
+
+/// 表规模查询：返回行数与空间占用，且能按名字子串过滤。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn list_table_sizes_reports_rows_and_space() {
+    let pool = test_pool();
+    let fx = setup_fixture(&pool, "sizes").await;
+    let resultset = list_table_sizes(&pool, Some(&fx.table))
+        .await
+        .expect("list_table_sizes must succeed");
+    assert!(
+        !resultset.rows.is_empty(),
+        "fixture table must be reported: {resultset:?}"
+    );
+    let row_pos = resultset
+        .columns
+        .iter()
+        .position(|c| c == "ROW_COUNT")
+        .expect("ROW_COUNT column");
+    let name_pos = resultset
+        .columns
+        .iter()
+        .position(|c| c == "TABLE_NAME")
+        .expect("TABLE_NAME column");
+    // 精确过滤不得把 `mcp_it_sizes` 与 `mcp_it_sizes_v` 混淆（视图无行数）。
+    let matched: Vec<&String> = resultset
+        .rows
+        .iter()
+        .filter(|r| r[name_pos] == fx.table)
+        .map(|r| &r[row_pos])
+        .collect();
+    assert_eq!(
+        matched.len(),
+        1,
+        "expected exactly one match: {resultset:?}"
+    );
+    assert_eq!(matched[0], "2", "fixture inserted 2 rows");
+    teardown_fixture(&pool, &fx).await;
+}
+
+/// 列出数据库：当前库必须在列出来的清单里。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn list_databases_includes_current_database() {
+    let pool = test_pool();
+    let resultset = list_databases(&pool)
+        .await
+        .expect("list_databases must succeed");
+    let name_pos = resultset
+        .columns
+        .iter()
+        .position(|c| c == "DATABASE_NAME")
+        .expect("DATABASE_NAME column");
+    let config = DbConfig::from_env().expect("config");
+    assert!(
+        resultset
+            .rows
+            .iter()
+            .any(|r| r[name_pos] == config.database),
+        "current database {} missing: {resultset:?}",
+        config.database
+    );
+}
+
+/// 输出格式：JSON 必须是可被解析器读回的对象数组。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn execute_query_renders_json_format() {
+    let pool = test_pool();
+    let fx = setup_fixture(&pool, "jsonfmt").await;
+    let query = format!("SELECT id, customer FROM dbo.{} ORDER BY id", fx.table);
+    let out = execute_query(&pool, "master", &query, OutputFormat::Json)
+        .await
+        .expect("JSON query must succeed");
+    let parsed: Vec<std::collections::BTreeMap<String, String>> =
+        serde_json::from_str(&out).expect("output must parse as JSON");
+    assert_eq!(parsed.len(), 2, "expected 2 rows: {out}");
+    // 含逗号的值在 JSON 里无需转义即可完整取回。
+    assert_eq!(parsed[0]["customer"], "Alice, Inc");
+    assert_eq!(parsed[1]["customer"], "Bob \"the builder\"");
+    teardown_fixture(&pool, &fx).await;
+}
+
+/// 输出格式：Markdown 必须是表格，且单元格里的 `|` 已转义。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn execute_query_renders_markdown_format() {
+    let pool = test_pool();
+    let fx = setup_fixture(&pool, "mdfmt").await;
+    let query = format!("SELECT id, customer FROM dbo.{} ORDER BY id", fx.table);
+    let out = execute_query(&pool, "master", &query, OutputFormat::Markdown)
+        .await
+        .expect("Markdown query must succeed");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("| id |"), "header: {out}");
+    assert!(lines[1].starts_with("| --- |"), "separator: {out}");
+    // 每行数据都必须是恰好 3 个未转义的 `|`（两边界 + 一列分隔）。
+    for line in &lines[2..] {
+        let unescaped = line.matches('|').count() - line.matches("\\|").count();
+        assert_eq!(unescaped, 3, "row must stay 2 columns: {line}");
+    }
+    teardown_fixture(&pool, &fx).await;
+}
+
+/// 资源清单必须带 schema（`sales.orders` 而非 `orders`），否则跨 schema 会读错表。
+#[tokio::test]
+#[ignore = "requires a live SQL Server"]
+async fn list_tables_and_views_includes_schema() {
+    let pool = test_pool();
+    let objects = list_tables_and_views(&pool)
+        .await
+        .expect("listing must succeed");
+    assert!(!objects.is_empty(), "expected at least one object");
+    for object in &objects {
+        assert!(
+            object.name.contains('.'),
+            "object name must be schema-qualified: {:?}",
+            object.name
+        );
+    }
 }
