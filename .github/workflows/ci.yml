@@ -43,6 +43,14 @@ jobs:
       - name: Test
         run: cargo test
 
+      # `http` feature 依赖 axum/hyper，默认 feature 集不会编译到，
+      # 必须单独跑一遍，否则改了 src/http.rs 也不会在 CI 上暴露。
+      - name: Check (http feature)
+        run: cargo clippy --all-targets --features http -- -D warnings
+
+      - name: Test (http feature)
+        run: cargo test --features http
+
   integration:
     name: Integration (SQL Server 2022)
     runs-on: ubuntu-latest
@@ -67,6 +75,10 @@ jobs:
 
       - name: Integration tests
         run: cargo test --test integration -- --ignored
+
+      # 新增功能（视图定义/表规模/多库/输出格式）也在真实 Server 上验证。
+      - name: Integration tests (http feature)
+        run: cargo test --test integration --features http -- --ignored
 
       # 无论成败都清理，避免容器/数据卷残留占用 runner 资源。
       - name: Tear down SQL Server

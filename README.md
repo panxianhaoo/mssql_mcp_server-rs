@@ -31,6 +31,7 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 - **`describe_table` 可选分节**：`include_row_count`（行数与空间）、`include_dependent_views`（引用该表的视图及其定义 SQL），默认关闭以保持既有「两段 CSV」格式
 - **资源 `mssql://{table}/data`**：每张用户表/视图一个资源，读取前 100 行；资源名称区分 `Table: x` / `View: x`；`resources/list` 按 cursor 分页（每页最多 500 条），大目录下响应体有界
   - URI 中的表名带 schema（`mssql://dbo.orders/data`），避免跨 schema 落到默认 schema 读错表
+  - 同时声明资源模板 `mssql://{table}/data`，客户端可直接补全而不必先枚举
 - **连接池**：内置 bb8 连接池（最多 4 个连接，借出前 `SELECT 1` 探活），复用连接省去每请求的 TCP/TDS 握手开销
 
 ## 环境变量
@@ -44,6 +45,10 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 | `MSSQL_DATABASE` | **是** | | 数据库名 |
 | `MSSQL_AUTH` | 否 | `sql` | `sql`：SQL 登录（默认，需用户名密码）；`windows`：Windows 集成认证（仅 Windows 平台，使用当前登录用户，无需用户名密码） |
 | `MSSQL_ENCRYPT` | 否 | `false` | 非加密改为 `true` 启用 TLS（Azure 连接始终加密） |
+
+| `MSSQL_TRANSPORT` | 否 | `stdio` | `stdio`：本地子进程（默认）；`http`：HTTP 服务（**需启用 `http` feature** 编译） |
+| `MSSQL_HTTP_ADDR` | 否 | `127.0.0.1:8000` | `MSSQL_TRANSPORT=http` 时的监听地址 |
+| `MSSQL_HTTP_BEARER_TOKEN` | 否 | | HTTP 模式的 bearer token；**绑定非 loopback 地址时必须设置**，否则拒绝启动 |
 
 日志通过 `RUST_LOG`（默认 `info`）控制，全部输出到 stderr，不干扰 stdout 协议流。
 
@@ -63,6 +68,21 @@ Windows 集成认证（免密，使用当前登录用户）：
 $env:MSSQL_AUTH="windows"; $env:MSSQL_DATABASE="master"
 .\target\release\mssql_mcp_server-rs.exe
 ```
+
+HTTP 传输（远程/多客户端共享，需 `--features http`）：
+
+```bash
+cargo build --release --features http
+
+MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=127.0.0.1:8000 \
+MSSQL_USER=sa MSSQL_PASSWORD=your_password MSSQL_DATABASE=master \
+  ./target/release/mssql_mcp_server-rs
+# 端点：http://127.0.0.1:8000/mcp
+```
+
+绑定到非 loopback 地址（如 `0.0.0.0`）**必须**同时设置 `MSSQL_HTTP_BEARER_TOKEN`，
+否则进程拒绝启动——避免无意间把数据库暴露到局域网。客户端需带
+`Authorization: Bearer <token>`。生产部署请前置带 TLS 的反向代理。
 
 ## 在 Claude Code 中使用
 

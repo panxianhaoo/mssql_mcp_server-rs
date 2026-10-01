@@ -25,6 +25,15 @@ log = "0.4"
 env_logger = "0.11"
 bb8 = "0.9.1"
 
+# HTTP 传输（streamable-http）为可选特性：默认只提供 stdio，避免为不需要
+# 远程部署的用户引入 axum/hyper 依赖树。
+axum = { version = "0.8", optional = true }
+
+[features]
+default = []
+# 启用后可用 MSSQL_TRANSPORT=http 通过 HTTP 提供 MCP（默认 stdio）。
+http = ["dep:axum", "rmcp/transport-streamable-http-server"]
+
 # Windows 集成认证（SSPI）：仅 Windows 目标启用 winauth feature。
 [target.'cfg(windows)'.dependencies]
 tiberius = { version = "0.13", default-features = false, features = ["winauth"] }

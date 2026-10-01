@@ -6,6 +6,8 @@
 pub mod config;
 pub mod db;
 pub mod format;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod pool;
 pub mod resultset;
 pub mod server;

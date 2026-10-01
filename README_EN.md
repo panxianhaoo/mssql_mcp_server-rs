@@ -29,6 +29,7 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
 - **Optional `describe_table` sections**: `include_row_count` (rows and space) and `include_dependent_views` (views referencing the table, with their definition SQL); off by default to preserve the existing two-section CSV layout
 - **Resource `mssql://{table}/data`**: one resource per user table/view, reading the first 100 rows; resource names distinguish `Table: x` / `View: x`; `resources/list` is cursor-paginated (max 500 items per page), keeping response size bounded on large catalogs
   - Resource names carry the schema (`mssql://dbo.orders/data`) so cross-schema lookups don't silently fall back to the default schema
+  - A resource template `mssql://{table}/data` is also advertised, letting clients complete URIs instead of enumerating first
 - **Connection pool**: built-in bb8 pool (max 4 connections, `SELECT 1` liveness check on checkout), reusing connections instead of a TCP/TDS handshake per request
 
 ## Environment Variables
@@ -42,6 +43,9 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
 | `MSSQL_DATABASE` | **Yes** | | Database name |
 | `MSSQL_AUTH` | No | `sql` | `sql`: SQL login (default, requires username/password); `windows`: Windows Integrated Auth (Windows only, uses the current logged-in user, no username/password needed) |
 | `MSSQL_ENCRYPT` | No | `false` | Set to `true` to enable TLS (Azure connections are always encrypted) |
+| `MSSQL_TRANSPORT` | No | `stdio` | `stdio`: local subprocess (default); `http`: HTTP server (**requires building with the `http` feature**) |
+| `MSSQL_HTTP_ADDR` | No | `127.0.0.1:8000` | Listen address when `MSSQL_TRANSPORT=http` |
+| `MSSQL_HTTP_BEARER_TOKEN` | No | | Bearer token for HTTP mode; **required when binding a non-loopback address**, otherwise startup is refused |
 
 Logs are controlled via `RUST_LOG` (default `info`) and go entirely to stderr, so they never interfere with the stdout protocol stream.
 
