@@ -131,7 +131,7 @@ pub async fn describe_table(pool: &DbPool, schema: Option<&str>, table: &str) ->
     let indexes = describe_indexes(&mut client, schema, table).await?;
     // 分节标记带 `#` 前缀：下游按注释行跳过即可用标准 CSV 解析器读取两段。
     Ok(format!(
-        "{}\n\nINDEXES\n{}",
+        "{}\n\n# INDEXES\n{}",
         resultset_to_csv(&columns),
         resultset_to_csv(&indexes)
     ))
@@ -151,17 +151,11 @@ async fn describe_columns(
     let stream = match schema {
         // @P1 = 表名，@P2 = schema 名（位置绑定，见上方说明）。
         Some(schema_name) => {
-            const DESCRIBE_SQL: &str = "SELECT TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, \
-         CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT \
-         FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1";
-            let sql = format!("{DESCRIBE_SQL} AND TABLE_SCHEMA = @P2 ORDER BY ORDINAL_POSITION");
+            let sql = columns_query(schema);
             client.query(&sql, &[&table, &schema_name]).await
         }
         None => {
-            const DESCRIBE_SQL: &str = "SELECT TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, \
-         CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT \
-         FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1";
-            let sql = format!("{DESCRIBE_SQL} ORDER BY ORDINAL_POSITION");
+            let sql = columns_query(schema);
             client.query(&sql, &[&table]).await
         }
     }
@@ -169,14 +163,32 @@ async fn describe_columns(
     collect_first_resultset(stream).await
 }
 
-/// 查询索引信息：`sys.indexes` 聚合键列与包含列（`STRING_AGG`，需 SQL Server 2017+）。
-/// 堆表无索引行，返回仅含表头的空结果。
+/// 构造列结构查询 SQL：`schema` 为 `Some` 时附加 `TABLE_SCHEMA = @P2` 过滤。
+///
+fn columns_query(schema: Option<&str>) -> String {
+    const SELECT_FROM: &str = "SELECT TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, \
+         CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT \
+         FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1";
+    const ORDER_BY: &str = " ORDER BY ORDINAL_POSITION";
+    match schema {
+        Some(_) => format!("{SELECT_FROM} AND TABLE_SCHEMA = @P2{ORDER_BY}"),
+        None => format!("{SELECT_FROM}{ORDER_BY}"),
+    }
+}
+
+/// 查询索引信息：`sys.indexes` 联 `sys.index_columns`，每个键列/包含列输出一行
+/// （tidy/long 格式）。堆表无索引行，返回仅含表头的空结果。
+///
+/// 之所以不用 `STRING_AGG` 把多个键列拼进单个字段：拼接结果里的逗号会破坏
+/// CSV 的列对齐（复合索引很常见，例如 `(last_name, first_name)`），而这属于
+/// SQL Server 侧聚合，Rust 转义层无从补救。一行一列则天然无歧义。
 async fn describe_indexes(
     client: &mut Client<Compat<TcpStream>>,
     schema: Option<&str>,
     table: &str,
 ) -> Result<Resultset> {
     let sql = indexes_query(schema);
+    // 位置绑定：`@P1` = 表名，`@P2` = schema 名。
     let stream = match schema {
         Some(schema_name) => client.query(&sql, &[&table, &schema_name]).await,
         None => client.query(&sql, &[&table]).await,
@@ -185,30 +197,31 @@ async fn describe_indexes(
     collect_first_resultset(stream).await
 }
 
-/// 构造索引查询 SQL：`schema` 为 `Some` 时附加 `SCHEMA_NAME = @P2` 过滤；
-/// 主键排在最前，其余按 schema、名称排序。
+/// 构造索引查询 SQL：`schema` 为 `Some` 时附加 `SCHEMA_NAME = @P2` 过滤。
+///
+/// 每个索引列一行，列含：`OBJECT_SCHEMA`、`INDEX_NAME`、`INDEX_TYPE`、`IS_UNIQUE`、
+/// `IS_PRIMARY_KEY`、`COLUMN_NAME`、`IS_INCLUDED_COLUMN`、`KEY_ORDINAL`。
+/// 排序：主键索引优先，其后按 schema、索引名，索引内部先是键列（按 `key_ordinal`）
+/// 再是包含列。
 fn indexes_query(schema: Option<&str>) -> String {
     const SELECT_FROM: &str = "SELECT SCHEMA_NAME(o.schema_id) AS OBJECT_SCHEMA, \
          i.name AS INDEX_NAME, i.type_desc AS INDEX_TYPE, \
          CASE WHEN i.is_unique = 1 THEN 'YES' ELSE 'NO' END AS IS_UNIQUE, \
          CASE WHEN i.is_primary_key = 1 THEN 'YES' ELSE 'NO' END AS IS_PRIMARY_KEY, \
-         STRING_AGG(CAST(c.name AS nvarchar(max)), ',') \
-             WITHIN GROUP (ORDER BY ic.key_ordinal) AS KEY_COLUMNS, \
-         STRING_AGG(CASE WHEN ic.is_included_column = 1 THEN c.name END, ',') \
-             WITHIN GROUP (ORDER BY ic.key_ordinal) AS INCLUDED_COLUMNS \
+         c.name AS COLUMN_NAME, \
+         CASE WHEN ic.is_included_column = 1 THEN 'YES' ELSE 'NO' END AS IS_INCLUDED_COLUMN, \
+         ic.key_ordinal AS KEY_ORDINAL \
          FROM sys.indexes i \
          JOIN sys.objects o ON o.object_id = i.object_id \
          JOIN sys.index_columns ic \
              ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
          JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
          WHERE o.name = @P1";
-    const GROUP_BY: &str =
-        " GROUP BY o.schema_id, i.name, i.type_desc, i.is_unique, i.is_primary_key";
-    const ORDER_BY: &str = " ORDER BY IS_PRIMARY_KEY DESC, OBJECT_SCHEMA, INDEX_NAME";
+    const ORDER_BY: &str = " ORDER BY IS_PRIMARY_KEY DESC, OBJECT_SCHEMA, INDEX_NAME, \
+         ic.is_included_column, ic.key_ordinal";
     match schema {
-        // schema 过滤作用于行级 WHERE，必须位于 GROUP BY 之前。
-        Some(_) => format!("{SELECT_FROM} AND SCHEMA_NAME(o.schema_id) = @P2{GROUP_BY}{ORDER_BY}"),
-        None => format!("{SELECT_FROM}{GROUP_BY}{ORDER_BY}"),
+        Some(_) => format!("{SELECT_FROM} AND SCHEMA_NAME(o.schema_id) = @P2{ORDER_BY}"),
+        None => format!("{SELECT_FROM}{ORDER_BY}"),
     }
 }
 
