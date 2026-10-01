@@ -7,6 +7,10 @@
 
 name: Release
 
+# 默认借用 tag 指向的 commit 消息作为标题，与同一 commit 触发的 CI run 完全同名，
+# 在 Actions 列表里难以区分；显式冠上 tag 名即可一眼辨别。
+run-name: Release ${{ github.ref_name }}
+
 on:
   push:
     tags: ['v*']
