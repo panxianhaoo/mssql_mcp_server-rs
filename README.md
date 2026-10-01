@@ -22,9 +22,50 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
   - `COLLATION_NAME` 逐列给出排序规则（SQL Server 支持**列级** collation，同一张表可混用不同规则），非字符类型该列为 `NULL`；这一列放在最末，以降低对既有「按位置」消费者的影响
   - 不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列
   - 跳过 `# ` 开头的注释行后，两段均可交由标准 CSV 解析器读取
-- **`format` 参数**（`execute_sql` / `table_sizes` / `list_databases`）：输出格式可选 `csv`（默认）、`json`、`markdown`
+- **`format` 参数**（`execute_sql` / `table_sizes` / `list_databases`）：输出格式可选 `csv`（默认）、`json`、`markdown`（简写 `md`），大小写不敏感
   - `json` 输出对象数组，含逗号/引号的值无需转义即可无歧义解析；值一律为字符串，以保留 money 定点、二进制十六进制等渲染语义
   - `markdown` 输出表格，单元格内的 `|` 转义为 `\|`、换行折叠为 `<br>`
+  - 注意 `describe_table` 不支持 `format`：它返回带 `# INDEXES` 等注释行分隔的多段结构，切成 JSON/Markdown 会破坏分段（要视图定义用 `include_dependent_views`，要行数用 `include_row_count`）
+  - 同一条 `SELECT id, note FROM ...`（`note` 含逗号/竖线/换行）的三种输出：
+
+    `csv`
+
+    ```
+    id,note
+    1,"a,b"
+    2,x|y
+    3,"l1
+    l2"
+    ```
+
+    `json`
+
+    ```json
+    [
+      {
+        "id": "1",
+        "note": "a,b"
+      },
+      {
+        "id": "2",
+        "note": "x|y"
+      },
+      {
+        "id": "3",
+        "note": "l1\nl2"
+      }
+    ]
+    ```
+
+    `markdown`
+
+    ```
+    | id | note |
+    | --- | --- |
+    | 1 | a,b |
+    | 2 | x\|y |
+    | 3 | l1<br>l2 |
+    ```
 - **工具 `table_sizes`**：报告用户表的行数与磁盘占用（取自元数据，恒 O(1)，**不扫表**）；可按表名子串过滤
 - **工具 `list_databases`**：列出服务器上的数据库（仅 ONLINE 且当前登录可访问），便于先发现库再查表
 - **多数据库**：`execute_sql` / `describe_table` / `table_sizes` 均可带 `database` 参数；每个库按需建独立连接池（不用 `USE` 切库——`USE` 是连接级状态，会泄漏给下一个借用者）
@@ -45,7 +86,6 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 | `MSSQL_DATABASE` | **是** | | 数据库名 |
 | `MSSQL_AUTH` | 否 | `sql` | `sql`：SQL 登录（默认，需用户名密码）；`windows`：Windows 集成认证（仅 Windows 平台，使用当前登录用户，无需用户名密码） |
 | `MSSQL_ENCRYPT` | 否 | `false` | 非加密改为 `true` 启用 TLS（Azure 连接始终加密） |
-
 | `MSSQL_TRANSPORT` | 否 | `stdio` | `stdio`：本地子进程（默认）；`http`：HTTP 服务（**需启用 `http` feature** 编译） |
 | `MSSQL_HTTP_ADDR` | 否 | `127.0.0.1:8000` | `MSSQL_TRANSPORT=http` 时的监听地址 |
 | `MSSQL_HTTP_BEARER_TOKEN` | 否 | | HTTP 模式的 bearer token；**绑定非 loopback 地址时必须设置**，否则拒绝启动 |

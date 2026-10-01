@@ -20,9 +20,50 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
   - `COLLATION_NAME` reports the collation per column (SQL Server supports **column-level** collation, so one table may mix different rules); it is `NULL` for non-character types. Listed last to reduce impact on existing positional consumers
   - Without a schema qualifier, all schemas are matched and the result includes `TABLE_SCHEMA`/`OBJECT_SCHEMA` columns
   - Skip lines starting with `# ` and both sections can be fed to a standard CSV parser
-- **`format` parameter** (`execute_sql` / `table_sizes` / `list_databases`): output format `csv` (default), `json`, or `markdown`
+- **`format` parameter** (`execute_sql` / `table_sizes` / `list_databases`): output format `csv` (default), `json`, or `markdown` (`md` for short); case-insensitive
   - `json` emits an array of objects; values containing commas/quotes need no escaping to round-trip unambiguously. Values are always strings, preserving money fixed-point, hex binary, and other rendering semantics
   - `markdown` emits a table, escaping `|` as `\|` and collapsing newlines to `<br>`
+  - `describe_table` has no `format`: it returns sections separated by `# INDEXES`-style comment lines, which JSON/Markdown would flatten (use `include_dependent_views` for view definitions, `include_row_count` for row counts)
+  - The same `SELECT id, note FROM ...` (with `note` containing commas/pipes/newlines) in all three formats:
+
+    `csv`
+
+    ```
+    id,note
+    1,"a,b"
+    2,x|y
+    3,"l1
+    l2"
+    ```
+
+    `json`
+
+    ```json
+    [
+      {
+        "id": "1",
+        "note": "a,b"
+      },
+      {
+        "id": "2",
+        "note": "x|y"
+      },
+      {
+        "id": "3",
+        "note": "l1\nl2"
+      }
+    ]
+    ```
+
+    `markdown`
+
+    ```
+    | id | note |
+    | --- | --- |
+    | 1 | a,b |
+    | 2 | x\|y |
+    | 3 | l1<br>l2 |
+    ```
 - **Tool `table_sizes`**: reports row counts and disk usage for user tables, read from metadata (always O(1) — **no table scan**); optionally filter by table-name substring
 - **Tool `list_databases`**: lists databases on the server that are online and accessible to the current login, so you can discover databases before querying tables
 - **Multi-database**: `execute_sql` / `describe_table` / `table_sizes` accept a `database` parameter; each database gets its own lazily-created connection pool (rather than `USE` — that is connection-level state and leaks to the next borrower)
