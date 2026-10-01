@@ -11,12 +11,16 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 
 - **工具 `execute_sql`**：执行只读 SQL 查询
   - 仅允许单条 `SELECT`（含 `WITH ... SELECT`）；任何修改语句（INSERT/UPDATE/DELETE/DDL/EXEC 等）与多语句批次都会被拒绝
-  - `SELECT` 返回 CSV 格式结果（首行列名）
+  - `SELECT` 返回 RFC 4180 CSV 格式结果（首行列名；含逗号/引号/换行的值按引号包裹转义）
   - NULL 值渲染为 `NULL`、二进制渲染为十六进制、时间渲染为 ISO 格式
   - 对 `INFORMATION_SCHEMA.TABLES` 的查询返回 `Tables_in_{database}` 风格的表清单
 - **工具 `describe_table`**：查看表或视图的结构（列名、类型、可空性、长度/精度、默认值）与索引信息（名称、类型、唯一性、主键、键列、包含列）
   - 参数 `table` 接受 `users`、`dbo.users` 或视图名；表名经参数绑定传入，无注入风险
-  - 返回 CSV，按列顺序排列；其后为 `INDEXES` 分节（CSV，无索引时仅表头；索引查询使用 `STRING_AGG`，需 SQL Server 2017+）；不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列
+  - 返回**两段 CSV**：先是列信息（按列序），空一行后以注释行 `# INDEXES` 引出第二段索引信息。每个索引列一行（复合主键的每个键列各自成行，`INCLUDE` 列亦单独一行并标 `IS_INCLUDED_COLUMN=YES`），因此不存在逗号拼接导致的列错位；无索引时第二段仅表头
+  - 列信息为 9 列：`TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT, COLLATION_NAME`
+  - `COLLATION_NAME` 逐列给出排序规则（SQL Server 支持**列级** collation，同一张表可混用不同规则），非字符类型该列为 `NULL`；这一列放在最末，以降低对既有「按位置」消费者的影响
+  - 不带 schema 时匹配所有 schema，结果含 `TABLE_SCHEMA`/`OBJECT_SCHEMA` 列
+  - 跳过 `# ` 开头的注释行后，两段均可交由标准 CSV 解析器读取
 - **资源 `mssql://{table}/data`**：每张用户表/视图一个资源，读取前 100 行；资源名称区分 `Table: x` / `View: x`；`resources/list` 按 cursor 分页（每页最多 500 条），大目录下响应体有界
 - **连接池**：内置 bb8 连接池（最多 4 个连接，借出前 `SELECT 1` 探活），复用连接省去每请求的 TCP/TDS 握手开销
 
@@ -68,9 +72,31 @@ claude mcp add mssql -- ./path/to/mssql_mcp_server-rs \
 ## 开发
 
 ```bash
-cargo test    # 单元测试（表名校验、SELECT 判断、配置解析、值格式化）
+cargo test    # 单元测试（表名校验、SELECT 判断、配置解析、值格式化、CSV 渲染）
 cargo clippy
 ```
+
+代码组织为 library crate（`src/lib.rs`）+ 薄二进制入口（`src/main.rs`），
+因此 `tests/integration.rs` 可直接调用 `db`/`config` 等模块。
+
+### 集成测试
+
+需要真实 SQL Server。仓库自带 compose 文件，一条命令即可起好实例：`--wait`
+会阻塞到实例健康检查通过，不需要手动 sleep。
+
+```bash
+docker compose up -d --wait
+
+MSSQL_SERVER=localhost MSSQL_PORT=14333 \
+MSSQL_USER=sa MSSQL_PASSWORD='YourStrong!Passw0rd' MSSQL_DATABASE=master \
+  cargo test --test integration -- --ignored
+
+docker compose down        # 加 -v 连同数据卷删除
+```
+
+测试会各自创建**专属命名**的表/视图/索引（复合主键、带 `INCLUDE` 列的索引、
+含逗号与引号的数据行），互不干扰，因此既无需预置 schema、也可并行执行，
+重复运行结果稳定。CI 在 Linux runner 上跑同样这组用例。
 
 ## License
 

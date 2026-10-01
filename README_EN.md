@@ -10,12 +10,16 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
 
 - **Tool `execute_sql`**: run read-only SQL queries
   - Only a single `SELECT` statement (including `WITH ... SELECT`) is allowed; any modifying statement (INSERT/UPDATE/DELETE/DDL/EXEC, etc.) or multi-statement batch is rejected
-  - `SELECT` results are returned as CSV (first row = column names)
+  - `SELECT` results are returned as RFC 4180 CSV (first row = column names; values containing commas, quotes or newlines are quoted and escaped)
   - NULL values render as `NULL`, binary as hexadecimal, timestamps in ISO format
   - Queries against `INFORMATION_SCHEMA.TABLES` return a `Tables_in_{database}`-style table listing
-- **Tool `describe_table`**: inspect the structure of a table or view (column names, types, nullability, length/precision, defaults) plus index information (name, type, uniqueness, primary key, key columns, included columns)
+- **Tool `describe_table`**: inspect the structure of a table or view (column names, types, nullability, length/precision, defaults, collation) plus index information (name, type, uniqueness, primary key, key columns, included columns)
   - The `table` parameter accepts `users`, `dbo.users`, or a view name; table names are passed via parameter binding — no injection risk
-  - Returns CSV ordered by column position, followed by an `INDEXES` section (CSV; header only when there are no indexes; the index query uses `STRING_AGG`, requires SQL Server 2017+). Without a schema qualifier, all schemas are matched and the result includes `TABLE_SCHEMA`/`OBJECT_SCHEMA` columns
+  - Returns **two CSV sections**: first the column info (in column order), then a blank line and a `# INDEXES` comment line introducing the second section. Each index column gets its own row (every key column of a composite primary key is emitted separately; included columns get their own row with `IS_INCLUDED_COLUMN=YES`), so there is no comma-joined field to tear CSV columns apart. Header only when there are no indexes
+  - The column section has 9 columns: `TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT, COLLATION_NAME`
+  - `COLLATION_NAME` reports the collation per column (SQL Server supports **column-level** collation, so one table may mix different rules); it is `NULL` for non-character types. Listed last to reduce impact on existing positional consumers
+  - Without a schema qualifier, all schemas are matched and the result includes `TABLE_SCHEMA`/`OBJECT_SCHEMA` columns
+  - Skip lines starting with `# ` and both sections can be fed to a standard CSV parser
 - **Resource `mssql://{table}/data`**: one resource per user table/view, reading the first 100 rows; resource names distinguish `Table: x` / `View: x`; `resources/list` is cursor-paginated (max 500 items per page), keeping response size bounded on large catalogs
 - **Connection pool**: built-in bb8 pool (max 4 connections, `SELECT 1` liveness check on checkout), reusing connections instead of a TCP/TDS handshake per request
 
@@ -67,9 +71,32 @@ claude mcp add mssql -- ./path/to/mssql_mcp_server-rs \
 ## Development
 
 ```bash
-cargo test    # unit tests (table name validation, SELECT detection, config parsing, value formatting)
+cargo test    # unit tests (table name validation, SELECT detection, config parsing, value formatting, CSV rendering)
 cargo clippy
 ```
+
+### Integration tests
+
+They need a real SQL Server. A compose file is included — one command brings up the
+instance, and `--wait` blocks until its health check passes (no manual sleep needed).
+
+```bash
+docker compose up -d --wait
+
+MSSQL_SERVER=localhost MSSQL_PORT=14333 \
+MSSQL_USER=sa MSSQL_PASSWORD='YourStrong!Passw0rd' MSSQL_DATABASE=master \
+  cargo test --test integration -- --ignored
+
+docker compose down        # add -v to also drop the data volume
+```
+
+Each test creates its own tables/views/indexes under a unique name (composite primary keys,
+indexes with included columns, rows containing commas and quotes), so nothing is shared:
+no schema setup is required, tests run safely in parallel, and repeated runs give stable
+results. CI runs the same suite on a Linux runner.
+
+The code is organized as a library crate (`src/lib.rs`) plus a thin binary (`src/main.rs`),
+which is what allows `tests/integration.rs` to call the `db`/`config` modules directly.
 
 ## License
 
