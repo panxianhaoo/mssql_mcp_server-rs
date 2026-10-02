@@ -32,7 +32,7 @@ impl OutputFormat {
             None => Some(Self::Csv),
             Some(v) if v.eq_ignore_ascii_case("csv") => Some(Self::Csv),
             Some(v) if v.eq_ignore_ascii_case("json") => Some(Self::Json),
-            Some(v) if v.eq_ignore_ascii_case("markdown") | v.eq_ignore_ascii_case("md") => {
+            Some(v) if v.eq_ignore_ascii_case("markdown") || v.eq_ignore_ascii_case("md") => {
                 Some(Self::Markdown)
             }
             Some(_) => None,

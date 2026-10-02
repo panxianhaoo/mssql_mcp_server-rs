@@ -137,22 +137,58 @@ async fn teardown_fixture(pool: &DbPool, fx: &Fixture) {
 /// 用真正的 CSV 解析器按 `\n` 分段解析，返回各段的行。
 /// `describe_table` 返回的是**两段** CSV，中间以 `# INDEXES` 注释行分隔。
 /// 注释行不是数据，按 `#` 前缀跳过，使每段都能用标准解析器校验列对齐。
+/// 按 `# LABEL` 分节标记把 `describe_table` 的输出切成若干段正文。
+///
+/// 不以空行（`\n\n`）为界：CSV 单元格里可以合法地含空行（多行文本列），
+/// 那时空行会把一个完整字段劈成两段。`# ` 只由 `push_section` 写在行首，
+/// 是唯一的可靠分界。
+fn split_sections(text: &str) -> Vec<String> {
+    let mut sections: Vec<String> = vec![String::new()];
+    for line in text.lines() {
+        if line.starts_with("# ") {
+            sections.push(String::new());
+            continue;
+        }
+        let last = sections.last_mut().expect("never empty");
+        last.push_str(line);
+        last.push('\n');
+    }
+    sections
+}
+
 fn parse_csv(text: &str) -> Vec<Vec<Vec<String>>> {
-    text.split("\n\n")
+    split_sections(text)
+        .iter()
         .map(|section| {
-            let without_comments = section
-                .lines()
-                .filter(|l| !l.trim_start().starts_with('#'))
-                .collect::<Vec<_>>()
-                .join("\n");
             csv::ReaderBuilder::new()
                 .has_headers(false)
-                .from_reader(without_comments.as_bytes())
+                .from_reader(section.as_bytes())
                 .records()
                 .map(|r| r.expect("CSV record").iter().map(str::to_string).collect())
                 .collect()
         })
         .collect()
+}
+
+/// 分段逻辑本身的回归测试：跑 integration suite 需要先起 SQL Server，
+/// 而这里是纯字符串处理，必须能在本地随 `cargo test` 验证。
+#[test]
+fn split_sections_splits_on_labels_only() {
+    let text = "a,b\n1,2\n\n# INDEXES\ni,j\n3,4";
+    let sections = split_sections(text);
+    assert_eq!(sections.len(), 2, "two sections: {sections:?}");
+    assert!(sections[0].starts_with("a,b"));
+    assert!(sections[1].starts_with("i,j"));
+}
+
+#[test]
+fn split_sections_keeps_blank_lines_inside_cells() {
+    // 回归点：单元格内的空行不能被当成分节边界。
+    // （真实 CSV 里多行值带引号，此处只验证分段本身不按空行切。）
+    let text = "note\nline1\n\nline2\n\n# ROW_COUNT\nn\n5\n";
+    let sections = split_sections(text);
+    assert_eq!(sections.len(), 2, "expected 2 sections: {sections:?}");
+    assert_eq!(sections[1].trim(), "n\n5");
 }
 
 #[tokio::test]
