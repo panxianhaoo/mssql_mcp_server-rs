@@ -20,16 +20,25 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 
 use crate::config::DbConfig;
+use crate::db::DatabasePools;
 use crate::server::McpServer;
 
 /// HTTP 监听地址的默认值：仅 loopback，避免无意间对外暴露数据库。
 const DEFAULT_HTTP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
+
+/// rmcp 默认放行的主机名（DNS rebinding 防护的基线白名单）。
+///
+/// 与 rmcp 的 `StreamableHttpServerConfig::default()` 保持一致，列出在此是为了
+/// 放行外部主机时把它们一并带上——否则用户为容器场景加一个域名，本地
+/// loopback 访问反而会断。若有朝一日 rmcp 改动默认值，这里需要同步。
+const DEFAULT_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 /// 通过 streamable-http 提供 MCP 服务（阻塞直到进程结束）。
 pub async fn serve_http(
     config: DbConfig,
     addr: SocketAddr,
     bearer_token: Option<String>,
+    allowed_hosts: Vec<String>,
 ) -> Result<()> {
     if !addr.ip().is_loopback() && bearer_token.is_none() {
         bail!(
@@ -39,12 +48,15 @@ pub async fn serve_http(
         );
     }
 
-    // 每个新 session 构造一个 McpServer：连接诃是 Clone（内部 Arc），
-    // 因此多 session 共享同一组连接诃，不会各建一套。
+    // rmcp 的 service_factory 会被反复调用（每个新 session 一次，工具 schema
+    // 缓存未命中时也会），因此**不能**在闭包里建连接池：那会让每个 session
+    // 各起一套 bb8 池，把连接数放大到客户端数 × max_size。这里在闭包外先建
+    // 好一组池，闭包内只 clone 内部的 Arc（见 `McpServer::with_pools`）。
+    let pools = std::sync::Arc::new(DatabasePools::new(config));
     let service = StreamableHttpService::new(
-        move || Ok(McpServer::new(config.clone())),
+        move || Ok(McpServer::with_pools(pools.clone())),
         std::sync::Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        http_server_config(allowed_hosts),
     );
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -57,6 +69,39 @@ pub async fn serve_http(
         .await
         .context("HTTP server failed")?;
     Ok(())
+}
+
+/// 构造 rmcp 的 HTTP 服务配置：在 loopback 默认值基础上并入用户显式允许的
+/// 主机名（DNS rebinding 防护白名单）。
+///
+/// 用户未提供白名单时保持 rmcp 的默认（只认 localhost/127.0.0.1/::1）；
+/// 一旦提供则**追加**而非替换 loopback 项，避免用户为了放行一个外部域名
+/// 就得连带重配本地访问。
+fn http_server_config(allowed_hosts: Vec<String>) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default();
+    if allowed_hosts.is_empty() {
+        return config;
+    }
+    config.with_allowed_hosts(
+        DEFAULT_ALLOWED_HOSTS
+            .iter()
+            .map(|host| (*host).to_string())
+            .chain(allowed_hosts),
+    )
+}
+
+/// 解析 `MSSQL_HTTP_ALLOWED_HOSTS`：逗号分隔的主机名或 `host:port`。
+///
+/// 容器化部署必须显式放行——`-p 8000:8000` 之后从宿主机访问时，Host 头是
+/// 宿主机地址，会被 rmcp 的 DNS rebinding 防护拦成 403 Forbidden。
+pub fn http_allowed_hosts_from_env(lookup: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    lookup("MSSQL_HTTP_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// 用 bearer token 包裹 MCP service：未配置 token 时直接暴露（仅限 loopback）。
@@ -168,5 +213,63 @@ mod tests {
         assert!(!constant_time_eq("secret", "secre"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn default_allowed_hosts_matches_rmcp_default() {
+        // 回归点：这份列表是 rmcp 默认值的副本。若 rmcp 升级后改了默认值，
+        // 这里会失败，提醒更新 `DEFAULT_ALLOWED_HOSTS`，而不是让用户撞上
+        // 「放行外部域名后本地 loopback 反而 403」。
+        assert_eq!(
+            StreamableHttpServerConfig::default().allowed_hosts,
+            DEFAULT_ALLOWED_HOSTS,
+            "rmcp default changed; update DEFAULT_ALLOWED_HOSTS"
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_parses_comma_separated_list() {
+        assert_eq!(
+            http_allowed_hosts_from_env(&lookup_from(&[(
+                "MSSQL_HTTP_ALLOWED_HOSTS",
+                "mcp.example.com, mcp.example.com:8443"
+            )])),
+            vec!["mcp.example.com", "mcp.example.com:8443"]
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_tolerates_blanks_and_empty_value() {
+        assert!(http_allowed_hosts_from_env(&lookup_from(&[])).is_empty());
+        assert!(
+            http_allowed_hosts_from_env(&lookup_from(&[("MSSQL_HTTP_ALLOWED_HOSTS", "")]))
+                .is_empty()
+        );
+        // 多余逗号产出的空项必须丢掉，否则会把空串塞进白名单。
+        assert_eq!(
+            http_allowed_hosts_from_env(&lookup_from(&[(
+                "MSSQL_HTTP_ALLOWED_HOSTS",
+                " , a.com , , b.com ,"
+            )])),
+            vec!["a.com", "b.com"]
+        );
+    }
+
+    #[test]
+    fn server_config_without_extra_hosts_keeps_loopback_default() {
+        assert_eq!(
+            http_server_config(Vec::new()).allowed_hosts,
+            DEFAULT_ALLOWED_HOSTS
+        );
+    }
+
+    #[test]
+    fn server_config_appends_extra_hosts_to_loopback() {
+        // 追加而非替换：放行外部域名不该顺手断掉本地访问。
+        let hosts = http_server_config(vec!["mcp.example.com".to_string()]).allowed_hosts;
+        assert_eq!(
+            hosts,
+            vec!["localhost", "127.0.0.1", "::1", "mcp.example.com"]
+        );
     }
 }

@@ -97,16 +97,29 @@ pub struct McpServer {
     /// 数据库配置（连接池之外的少量信息，如 `Tables_in_{database}` 表头用的库名）。
     config: Arc<DbConfig>,
     /// 按库名缓存的连接池，支撑多数据库查询。
-    pools: DatabasePools,
+    ///
+    /// 用 `Arc` 包一层是 HTTP 传输的关键：rmcp 的 service_factory 会被反复
+    /// 调用（每个新 session 一次，schema 缓存未命中时也会），若每次都新建
+    /// [`DatabasePools`]，每个 session 就会各起一套连接池，客户端数目直接
+    /// 放大到 SQL Server 的连接数上。共享同一个句柄才能真正池化。
+    pools: Arc<DatabasePools>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl McpServer {
+    /// 新建服务并连带创建默认库的连接池。
     pub fn new(config: DbConfig) -> Self {
+        Self::with_pools(Arc::new(DatabasePools::new(config)))
+    }
+
+    /// 复用一组已有的连接池（HTTP 传输下多 session 共享，见字段注释）。
+    ///
+    /// 此处只 `clone` 句柄内部的 `Arc`，不额外建立任何连接。
+    pub fn with_pools(pools: Arc<DatabasePools>) -> Self {
         Self {
-            pools: DatabasePools::new(config.clone()),
-            config: Arc::new(config),
+            config: Arc::new(pools.config().clone()),
+            pools,
             tool_router: Self::tool_router(),
         }
     }
@@ -174,11 +187,12 @@ impl McpServer {
         let (schema, table) = parse_table_name(&args.table)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let database = normalize_database(args.database.as_deref());
+        // 从默认分节派生而非重新列举全部字段：日后新增分节时，此处无需改动
+        // 也不会漏掉某个 flag。
         let sections = DescribeSections {
-            columns: true,
-            indexes: true,
             row_count: args.include_row_count.unwrap_or(false),
             dependent_views: args.include_dependent_views.unwrap_or(false),
+            ..DescribeSections::default_sections()
         };
         let pool = self.pool(database);
         // 数据库错误以文本形式返回（与 execute_sql 一致），便于客户端读到失败原因。

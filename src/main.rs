@@ -21,6 +21,8 @@ enum Transport {
     Http {
         addr: std::net::SocketAddr,
         bearer_token: Option<String>,
+        /// 显式放行的 Host 头（DNS rebinding 防护白名单），见 [`crate::http`]。
+        allowed_hosts: Vec<String>,
     },
 }
 
@@ -32,13 +34,17 @@ fn transport_from_env() -> anyhow::Result<Transport> {
     match raw.as_deref() {
         None | Some("") | Some("stdio") => Ok(Transport::Stdio),
         #[cfg(feature = "http")]
-        Some(v) if v.eq_ignore_ascii_case("http") => Ok(Transport::Http {
-            addr: mssql_mcp_server_rs::http::http_addr_from_env(&|name| std::env::var(name).ok())?,
-            bearer_token: std::env::var("MSSQL_HTTP_BEARER_TOKEN")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty()),
-        }),
+        Some(v) if v.eq_ignore_ascii_case("http") => {
+            let lookup = |name: &str| std::env::var(name).ok();
+            Ok(Transport::Http {
+                addr: mssql_mcp_server_rs::http::http_addr_from_env(&lookup)?,
+                bearer_token: std::env::var("MSSQL_HTTP_BEARER_TOKEN")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                allowed_hosts: mssql_mcp_server_rs::http::http_allowed_hosts_from_env(&lookup),
+            })
+        }
         Some(raw) => {
             let supported = if cfg!(feature = "http") {
                 "'stdio' or 'http'"
@@ -80,8 +86,13 @@ async fn main() -> anyhow::Result<()> {
             service.waiting().await?;
         }
         #[cfg(feature = "http")]
-        Transport::Http { addr, bearer_token } => {
-            mssql_mcp_server_rs::http::serve_http(db_config, addr, bearer_token).await?;
+        Transport::Http {
+            addr,
+            bearer_token,
+            allowed_hosts,
+        } => {
+            mssql_mcp_server_rs::http::serve_http(db_config, addr, bearer_token, allowed_hosts)
+                .await?;
         }
     }
     Ok(())

@@ -107,6 +107,11 @@ impl DatabasePools {
     pub fn default_database(&self) -> &str {
         &self.base.database
     }
+
+    /// 建池所用的配置模板（默认库名、`Tables_in_{database}` 表头等场景需要）。
+    pub fn config(&self) -> &DbConfig {
+        &self.base
+    }
 }
 
 /// 从连接池借出一个连接。
