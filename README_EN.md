@@ -11,8 +11,9 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
 - **Tool `execute_sql`**: run read-only SQL queries
   - Only a single `SELECT` statement (including `WITH ... SELECT`) is allowed; any modifying statement (INSERT/UPDATE/DELETE/DDL/EXEC, etc.) or multi-statement batch is rejected
   - `SELECT` results are returned as RFC 4180 CSV (first row = column names; values containing commas, quotes or newlines are quoted and escaped)
-  - NULL values render as `NULL`, binary as hexadecimal, timestamps in ISO format
-  - Queries against `INFORMATION_SCHEMA.TABLES` return a `Tables_in_{database}`-style table listing
+  - NULL values render as `NULL`, binary as hexadecimal, timestamps in ISO format; `money`/`smallmoney` keep 4 fixed-point decimals
+  - Datetime fractional digits **follow the column's scale**: `datetime2(7)` prints 7 digits (`.1234567`), `datetime2(1)` prints 1 (`.1`), `time(0)` prints none; `datetimeoffset` prints the converted local time plus an offset suffix (e.g. `2026-10-01 12:00:00.123+08:00`)
+  - Queries against `INFORMATION_SCHEMA.TABLES` return a `Tables_in_{database}`-style table listing (detected via lexical analysis, so mentions inside comments or strings do not trigger it; the bracketed form `[INFORMATION_SCHEMA].[TABLES]` does not either)
 - **Tool `describe_table`**: inspect the structure of a table or view (column names, types, nullability, length/precision, defaults, collation) plus index information (name, type, uniqueness, primary key, key columns, included columns)
   - The `table` parameter accepts `users`, `dbo.users`, or a view name; table names are passed via parameter binding — no injection risk
   - Returns **two CSV sections**: first the column info (in column order), then a blank line and a `# INDEXES` comment line introducing the second section. Each index column gets its own row (every key column of a composite primary key is emitted separately; included columns get their own row with `IS_INCLUDED_COLUMN=YES`), so there is no comma-joined field to tear CSV columns apart. Header only when there are no indexes
@@ -82,11 +83,12 @@ Built on the official Rust SDK [rmcp](https://github.com/modelcontextprotocol/ru
 | `MSSQL_USER` | **Yes** | | SQL auth username |
 | `MSSQL_PASSWORD` | **Yes** | | SQL auth password |
 | `MSSQL_DATABASE` | **Yes** | | Database name |
-| `MSSQL_AUTH` | No | `sql` | `sql`: SQL login (default, requires username/password); `windows`: Windows Integrated Auth (Windows only, uses the current logged-in user, no username/password needed) |
-| `MSSQL_ENCRYPT` | No | `false` | Set to `true` to enable TLS (Azure connections are always encrypted) |
+| `MSSQL_AUTH` | No | `sql` | `sql`: SQL login (default, requires username/password); `windows`: Windows Integrated Auth (Windows only, uses the current logged-in user, no username/password needed, TLS enabled by default) |
+| `MSSQL_ENCRYPT` | No | `false` | Set to `true` to enable TLS (Azure connections are always encrypted; Windows Integrated Auth enables it by default unless explicitly set to `false`) |
 | `MSSQL_TRANSPORT` | No | `stdio` | `stdio`: local subprocess (default); `http`: HTTP server (**requires building with the `http` feature**) |
 | `MSSQL_HTTP_ADDR` | No | `127.0.0.1:8000` | Listen address when `MSSQL_TRANSPORT=http` |
 | `MSSQL_HTTP_BEARER_TOKEN` | No | | Bearer token for HTTP mode; **required when binding a non-loopback address**, otherwise startup is refused |
+| `MSSQL_HTTP_ALLOWED_HOSTS` | No | | Extra `Host` headers to allow in HTTP mode (comma-separated); required when running in a container with `-p` port mapping and reaching it from outside, otherwise requests get `403` |
 
 Logs are controlled via `RUST_LOG` (default `info`) and go entirely to stderr, so they never interfere with the stdout protocol stream.
 
@@ -107,6 +109,36 @@ $env:MSSQL_AUTH="windows"; $env:MSSQL_DATABASE="master"
 .\target\release\mssql_mcp_server-rs.exe
 ```
 
+HTTP transport (remote / multi-client, requires `--features http`):
+
+```bash
+cargo build --release --features http
+
+MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=127.0.0.1:8000 \
+MSSQL_USER=sa MSSQL_PASSWORD=your_password MSSQL_DATABASE=master \
+  ./target/release/mssql_mcp_server-rs
+# Endpoint: http://127.0.0.1:8000/mcp
+```
+
+Binding a non-loopback address (e.g. `0.0.0.0`) **requires** `MSSQL_HTTP_BEARER_TOKEN`
+as well, otherwise startup is refused — this avoids accidentally exposing the
+database to the local network. Clients must send `Authorization: Bearer <token>`.
+Put a TLS-terminating reverse proxy in front for production.
+
+In containers you also need to allow the `Host` header: the transport only accepts
+`localhost` / `127.0.0.1` / `::1` by default (DNS rebinding protection), so reaching
+a `-p`-mapped port from the host carries the host's address and is rejected with
+`403 Forbidden: Host header is not allowed`.
+
+```bash
+MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=0.0.0.0:8000 \
+MSSQL_HTTP_BEARER_TOKEN=your_token \
+MSSQL_HTTP_ALLOWED_HOSTS=mcp.example.com,192.168.1.50:8000 \
+  ./target/release/mssql_mcp_server-rs
+```
+
+This list is **added to** the loopback allowlist, so local access keeps working.
+
 ## Use with Claude Code
 
 ```bash
@@ -117,9 +149,10 @@ claude mcp add mssql -- ./path/to/mssql_mcp_server-rs \
 
 ## Notes
 
-- Read-only protection: `execute_sql` accepts only a single SELECT query; modifying statements are rejected before being sent to the database. An application-layer allowlist cannot cover every edge case (e.g. functions with side effects), so in production pair it with a read-only database account
-- Windows Integrated Auth (SSPI): `MSSQL_AUTH=windows`, Windows only (startup fails on other platforms)
+- Read-only protection: `execute_sql` accepts only a single SELECT query; modifying statements are rejected before being sent to the database. This also covers statements that look like a SELECT but write (`SELECT ... INTO` creating and populating a table, `SELECT NEXT VALUE FOR` advancing a sequence). An application-layer allowlist cannot cover every edge case (e.g. functions with side effects), so in production pair it with a read-only database account
+- Windows Integrated Auth (SSPI): `MSSQL_AUTH=windows`, Windows only (startup fails on other platforms). Credentials travel on the wire, so TLS is enabled by default unless `MSSQL_ENCRYPT` is set
 - LocalDB named instances are not supported (direct TCP host:port connections only)
+- Precision limit: the `money` extremes ±`922337203685477.5808` cannot round-trip their last 4 decimals — the driver decodes money into an `f64`, and 19 significant digits are truncated at decode time. Ordinary values well inside that range are unaffected
 
 ## Development
 

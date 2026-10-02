@@ -13,8 +13,9 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 - **工具 `execute_sql`**：执行只读 SQL 查询
   - 仅允许单条 `SELECT`（含 `WITH ... SELECT`）；任何修改语句（INSERT/UPDATE/DELETE/DDL/EXEC 等）与多语句批次都会被拒绝
   - `SELECT` 返回 RFC 4180 CSV 格式结果（首行列名；含逗号/引号/换行的值按引号包裹转义）
-  - NULL 值渲染为 `NULL`、二进制渲染为十六进制、时间渲染为 ISO 格式
-  - 对 `INFORMATION_SCHEMA.TABLES` 的查询返回 `Tables_in_{database}` 风格的表清单
+  - NULL 值渲染为 `NULL`、二进制渲染为十六进制、时间渲染为 ISO 格式；`money`/`smallmoney` 保留 4 位定点小数
+  - 日期时间的小数位数**跟随列的 scale**：`datetime2(7)` 输出 7 位（`.1234567`）、`datetime2(1)` 输出 1 位（`.1`）、`time(0)` 不带小数；`datetimeoffset` 输出转换后的本地时间 + 偏移后缀（如 `2026-10-01 12:00:00.123+08:00`）
+  - 对 `INFORMATION_SCHEMA.TABLES` 的查询返回 `Tables_in_{database}` 风格的表清单（识别基于词法分析，注释与字符串里的同名文本不会误触发；写成 `[INFORMATION_SCHEMA].[TABLES]` 这种方括号形式不触发）
 - **工具 `describe_table`**：查看表或视图的结构（列名、类型、可空性、长度/精度、默认值）与索引信息（名称、类型、唯一性、主键、键列、包含列）
   - 参数 `table` 接受 `users`、`dbo.users` 或视图名；表名经参数绑定传入，无注入风险
   - 返回**两段 CSV**：先是列信息（按列序），空一行后以注释行 `# INDEXES` 引出第二段索引信息。每个索引列一行（复合主键的每个键列各自成行，`INCLUDE` 列亦单独一行并标 `IS_INCLUDED_COLUMN=YES`），因此不存在逗号拼接导致的列错位；无索引时第二段仅表头
@@ -84,11 +85,12 @@ Microsoft SQL Server 的 MCP（Model Context Protocol）服务器，Rust 实现�
 | `MSSQL_USER` | **是** | | SQL 认证用户名 |
 | `MSSQL_PASSWORD` | **是** | | SQL 认证密码 |
 | `MSSQL_DATABASE` | **是** | | 数据库名 |
-| `MSSQL_AUTH` | 否 | `sql` | `sql`：SQL 登录（默认，需用户名密码）；`windows`：Windows 集成认证（仅 Windows 平台，使用当前登录用户，无需用户名密码） |
-| `MSSQL_ENCRYPT` | 否 | `false` | 非加密改为 `true` 启用 TLS（Azure 连接始终加密） |
+| `MSSQL_AUTH` | 否 | `sql` | `sql`：SQL 登录（默认，需用户名密码）；`windows`：Windows 集成认证（仅 Windows 平台，使用当前登录用户，无需用户名密码，且默认启用 TLS） |
+| `MSSQL_ENCRYPT` | 否 | `false` | 非加密改为 `true` 启用 TLS（Azure 连接始终加密；Windows 集成认证默认启用，除非显式设为 `false`） |
 | `MSSQL_TRANSPORT` | 否 | `stdio` | `stdio`：本地子进程（默认）；`http`：HTTP 服务（**需启用 `http` feature** 编译） |
 | `MSSQL_HTTP_ADDR` | 否 | `127.0.0.1:8000` | `MSSQL_TRANSPORT=http` 时的监听地址 |
 | `MSSQL_HTTP_BEARER_TOKEN` | 否 | | HTTP 模式的 bearer token；**绑定非 loopback 地址时必须设置**，否则拒绝启动 |
+| `MSSQL_HTTP_ALLOWED_HOSTS` | 否 | | HTTP 模式下额外放行的 Host 头（逗号分隔）；容器部署`-p` 映射后从外部访问必须设置，否则 403 |
 
 日志通过 `RUST_LOG`（默认 `info`）控制，全部输出到 stderr，不干扰 stdout 协议流。
 
@@ -124,6 +126,19 @@ MSSQL_USER=sa MSSQL_PASSWORD=your_password MSSQL_DATABASE=master \
 否则进程拒绝启动——避免无意间把数据库暴露到局域网。客户端需带
 `Authorization: Bearer <token>`。生产部署请前置带 TLS 的反向代理。
 
+容器部署时还要放行 Host 头。传输层为阻断 DNS rebinding，默认只接受
+`localhost` / `127.0.0.1` / `::1`；用 `-p` 映射端口后从宿主机访问，请求里的
+Host 是宿主机地址，会被拦成 `403 Forbidden: Host header is not allowed`：
+
+```bash
+MSSQL_TRANSPORT=http MSSQL_HTTP_ADDR=0.0.0.0:8000 \
+MSSQL_HTTP_BEARER_TOKEN=your_token \
+MSSQL_HTTP_ALLOWED_HOSTS=mcp.example.com,192.168.1.50:8000 \
+  ./target/release/mssql_mcp_server-rs
+```
+
+该项是**追加**到 loopback 白名单之上，放行外部地址后本地访问依然可用。
+
 ## 在 Claude Code 中使用
 
 ```bash
@@ -135,8 +150,9 @@ claude mcp add mssql -- ./path/to/mssql_mcp_server-rs \
 ## 注意事项
 
 - 只读保护：`execute_sql` 仅接受单条 SELECT 查询，修改语句在发送到数据库前即被拒绝；除了 INSERT/UPDATE/DELETE/DDL/EXEC 与多语句批次，也会拒绝语法上是 SELECT 但会写入的语句（`SELECT ... INTO` 建表写数据、`SELECT NEXT VALUE FOR` 推进序列）。应用层白名单不能覆盖所有边界（如带副作用的函数），生产环境建议配合只读数据库账号
-- Windows 集成认证（SSPI）：`MSSQL_AUTH=windows`，仅 Windows 平台可用（非 Windows 启动即报错）
+- Windows 集成认证（SSPI）：`MSSQL_AUTH=windows`，仅 Windows 平台可用（非 Windows 启动即报错）；因凭据在线路上传输，未指定 `MSSQL_ENCRYPT` 时默认启用 TLS
 - 不支持 LocalDB 命名实例（仅 TCP 直连 host:port）
+- 精度限制：`money` 的极值 ±`922337203685477.5808` 无法还原末 4 位小数——驱动把 money 解码为 `f64`，19 位有效数字在解码时即被截断；该范围内的常见值不受影响
 
 ## 开发
 
