@@ -36,57 +36,33 @@ pub fn parse_table_name(table_name: &str) -> Result<(Option<String>, String)> {
     }
 }
 
-/// 移除 SQL 块注释 `/* ... */`（未闭合的注释吞掉其后全部内容）。
-fn strip_block_comments(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(start) = rest.find("/*") {
-        result.push_str(&rest[..start]);
-        match rest[start + 2..].find("*/") {
-            Some(end) => rest = &rest[start + 2 + end + 2..],
-            None => return result,
-        }
-    }
-    result.push_str(rest);
-    result
-}
-
-/// 移除单行注释 `-- ...`（每行 `--` 之后的内容）。
-fn strip_line_comments(input: &str) -> String {
-    input
-        .lines()
-        .map(|line| match line.find("--") {
-            Some(pos) => &line[..pos],
-            None => line,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 去掉 `--` 与 `/* */` 注释后的 SQL 文本。
-fn strip_comments(query: &str) -> String {
-    strip_line_comments(&strip_block_comments(query))
-}
-
-/// 判断查询是否为 SELECT 语句，正确处理 `--` 与 `/* */` 注释。
-pub fn is_select_query(query: &str) -> bool {
-    strip_comments(query)
-        .split_whitespace()
-        .next()
-        .is_some_and(|word| word.eq_ignore_ascii_case("select"))
-}
-
 /// 判断查询是否为对 `INFORMATION_SCHEMA.TABLES` 的查询（输出格式特判）。
 ///
-/// 匹配必须基于**去掉注释后**的文本：否则一条普通查询只要注释里提到
-/// `INFORMATION_SCHEMA.TABLES`，就会被误判成表清单查询而输出 mysql 风格的
-/// `Tables_in_{database}` 表头，丢掉真正的列名。
+/// 判定走词法分析而非子串搜索：必须跳过注释**与字符串字面量**，否则
+/// 一条普通查询只要在注释或字符串里提到 `INFORMATION_SCHEMA.TABLES`，
+/// 就会被误判成表清单查询而输出 mysql 风格的 `Tables_in_{database}` 表头，
+/// 丢掉真正的列名。这也保证它与 [`is_read_only_query`] 共用同一套词法，
+/// 不会出现两套注释/字符串处理规则各自解释一段 SQL。
 pub fn is_tables_listing_query(query: &str) -> bool {
-    let cleaned = strip_comments(query);
-    is_select_query(&cleaned)
-        && cleaned
-            .to_ascii_uppercase()
-            .contains("INFORMATION_SCHEMA.TABLES")
+    let tokens = tokenize(query);
+    if !tokens
+        .first()
+        .is_some_and(|token| matches!(token, Token::Ident(word) if word == "select"))
+    {
+        return false;
+    }
+    // `INFORMATION_SCHEMA.TABLES` 被切成「标识符 + Opaque(点) + 标识符」
+    // 三段，故按这个形状匹配。
+    tokens.windows(3).any(|window| {
+        matches!(
+            window,
+            [
+                Token::Ident(schema),
+                Token::Opaque,
+                Token::Ident(table)
+            ] if schema == "information_schema" && table == "tables"
+        )
+    })
 }
 
 /// 判断语句是否为只读查询：单条语句，且顶层语句为 `SELECT`，
@@ -343,30 +319,69 @@ mod tests {
     }
 
     #[test]
-    fn is_select_query_detects_select() {
-        assert!(is_select_query("SELECT * FROM t"));
-        assert!(is_select_query("  select 1"));
-        assert!(is_select_query("SELECT TOP 100 * FROM t"));
+    fn is_tables_listing_query_needs_unbracketed_dotted_name() {
+        // 已知取舍：方括号写法 `[INFORMATION_SCHEMA].[TABLES]` 的词元形状是
+        // 一串 Opaque（整个括起标识符被折叠），不匹配「标识符+点+标识符」，
+        // 因此不触发 mysql 风格表头——用户会拿到正常的列名与数据。
+        // 相比旧的子串实现会把注释/字符串里的提词也算上，这是保守方向。
+        for query in [
+            "SELECT TABLE_NAME FROM [INFORMATION_SCHEMA].[TABLES]",
+            "SELECT * FROM [information_schema].[tables]",
+        ] {
+            assert!(
+                !is_tables_listing_query(query),
+                "bracketed form is not treated as a listing query: {query}"
+            );
+        }
+        // 未加方括号的常见写法照常识别。
+        assert!(is_tables_listing_query(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES"
+        ));
     }
 
     #[test]
-    fn is_select_query_ignores_comments() {
-        assert!(is_select_query("-- leading comment\nSELECT 1"));
-        assert!(is_select_query("/* block */ SELECT 1"));
-        assert!(is_select_query("/* multi\nline */ SELECT 1"));
+    fn is_tables_listing_query_requires_select_as_first_statement() {
+        // 「首词必须是 SELECT」这一条件由 `is_tables_listing_query` 承担：
+        // 非 SELECT 语句即使提到目标视图也不算表清单查询。
+        for query in [
+            "UPDATE t SET x = 1 -- INFORMATION_SCHEMA.TABLES",
+            "INSERT INTO INFORMATION_SCHEMA.TABLES VALUES (1)",
+            "DELETE FROM t /* INFORMATION_SCHEMA.TABLES */",
+        ] {
+            assert!(!is_tables_listing_query(query), "should reject: {query}");
+        }
     }
 
     #[test]
-    fn is_select_query_rejects_non_select() {
-        assert!(!is_select_query("UPDATE t SET x = 1"));
-        assert!(!is_select_query("INSERT INTO t VALUES (1)"));
-        assert!(!is_select_query("DELETE FROM t"));
+    fn is_tables_listing_query_handles_leading_comments() {
+        // 前置注释不影响判定（词法分析会跳过）。
+        for query in [
+            "-- pick tables\nSELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES",
+            "/* block */ SELECT * FROM information_schema.tables",
+            "/* multi\nline */ SELECT 1 FROM INFORMATION_SCHEMA.TABLES",
+        ] {
+            assert!(is_tables_listing_query(query), "should detect: {query}");
+        }
     }
 
     #[test]
-    fn is_select_query_rejects_empty_and_comment_only() {
-        assert!(!is_select_query("   \n "));
-        assert!(!is_select_query("-- only a comment"));
+    fn is_tables_listing_query_ignores_mentions_in_string_literals() {
+        // 回归点：旧实现按子串搜索清洗后的文本，字符串里的提词会误触发
+        // mysql 风格表头，丢掉真正的列名。词法分析已把字面量折成 Opaque。
+        for query in [
+            "SELECT 'INFORMATION_SCHEMA.TABLES' AS note",
+            "SELECT * FROM t WHERE n = 'read INFORMATION_SCHEMA.TABLES first'",
+            "SELECT [INFORMATION_SCHEMA.TABLES] FROM t",
+        ] {
+            assert!(!is_tables_listing_query(query), "should reject: {query}");
+        }
+    }
+
+    #[test]
+    fn is_tables_listing_query_rejects_empty_and_comment_only() {
+        assert!(!is_tables_listing_query("   \n "));
+        assert!(!is_tables_listing_query("-- only a comment"));
+        assert!(!is_tables_listing_query(""));
     }
 
     #[test]
