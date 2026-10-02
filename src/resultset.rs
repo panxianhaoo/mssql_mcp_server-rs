@@ -26,17 +26,24 @@ impl Resultset {
 }
 
 /// 消费查询流，收集第一个结果集（能正确处理空结果集的列名）。
+///
+/// 后续结果集会被**丢弃但仍然读完**：tiberius 的 `Client` 不支持在响应流
+/// 未消费完时恢复（见其 "Cancellation safety" 文档——结果集流被中途丢弃的
+/// 连接不可复用）。若在这里 `break`，归还到池里的连接就停在半包状态，
+/// 下一次借用得先 `flush_stream()` 在网络层重新同步。宁可多读几包，也要
+/// 保证连接归还时是干净的。
 pub async fn collect_first_resultset(
     stream: tiberius::QueryStream<'_>,
 ) -> anyhow::Result<Resultset> {
     let mut stream = stream;
     let mut columns: Option<Vec<String>> = None;
     let mut rows: Vec<Vec<String>> = Vec::new();
+    // 第二个 metadata 出现即代表已进入新结果集：此后只排空、不再收录行。
+    let mut collecting = true;
 
     while let Some(item) = stream.next().await {
         match item? {
             QueryItem::Metadata(meta) => {
-                // 第一个 metadata 提供列名，第二个 metadata 意味着新的结果集，停止收集。
                 if columns.is_none() {
                     columns = Some(
                         meta.columns()
@@ -45,10 +52,13 @@ pub async fn collect_first_resultset(
                             .collect(),
                     );
                 } else {
-                    break;
+                    collecting = false;
                 }
             }
             QueryItem::Row(row) => {
+                if !collecting {
+                    continue;
+                }
                 if columns.is_none() {
                     columns = Some(row.columns().iter().map(|c| c.name().to_string()).collect());
                 }
