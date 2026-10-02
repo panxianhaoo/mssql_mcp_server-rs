@@ -27,6 +27,19 @@ impl AuthKind {
             Self::WindowsIntegrated => "current Windows user (integrated auth)".to_string(),
         }
     }
+
+    /// 该认证方式是否应当默认走加密连接。
+    ///
+    /// 集成认证在线路上传输 NTLM/Kerberos 握手凭据，明文链路等于把身份
+    /// 暴露给同网段的观察者；SQL 登录虽也传密码，但那些密码通常专用于
+    /// 数据库，且大量既有本地实例只用自签证书，故沿用原有默认不动。
+    fn requires_encryption(&self) -> bool {
+        match self {
+            Self::SqlServer { .. } => false,
+            #[cfg(windows)]
+            Self::WindowsIntegrated => true,
+        }
+    }
 }
 
 /// MSSQL 连接配置（由环境变量构建）。
@@ -77,21 +90,37 @@ impl DbConfig {
             AuthMode::Windows => AuthKind::WindowsIntegrated,
         };
         let port = parse_port(lookup("MSSQL_PORT").as_deref())?;
-        let encrypt = parse_bool(lookup("MSSQL_ENCRYPT").as_deref());
+        // 保留「未设置」与「显式 false」的区别：集成认证要据此决定是否强制加密。
+        let encrypt = lookup("MSSQL_ENCRYPT")
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.eq_ignore_ascii_case("true"));
         Ok(Self::build(server, port, database, auth, encrypt))
     }
 
-    /// 纯函数构建：Azure 连接强制加密且不信任自签证书。
+    /// 纯函数构建：Azure 与集成认证连接强制加密（除非显式关闭），Azure 另
+    /// 要求校验证书。
+    ///
+    /// `encrypt_env` 为 `None` 表示用户未表达偏好，此时按认证方式给安全默认；
+    /// `Some(false)` 是显式要求明文，必须予以尊重（本地自签证书排查场景）。
     fn build(
         server: String,
         port: u16,
         database: String,
         auth: AuthKind,
-        encrypt_env: bool,
+        encrypt_env: Option<bool>,
     ) -> Self {
         let is_azure = server.to_ascii_lowercase().contains(AZURE_DOMAIN_MARKER);
-        let encrypt = is_azure || encrypt_env;
-        // Azure 必须校验证书；本地/自建实例为方便自签证书场景默认信任。
+        // 集成认证走 NTLM/Kerberos 握手，凭据在链路上传输，必须包进 TLS；
+        // 仅有用户显式 `MSSQL_ENCRYPT=false` 才放行明文（此时 TLS 与自签证书
+        // 都无从谈起，故一并信任）。
+        let encrypt = match encrypt_env {
+            Some(explicit) => is_azure || explicit,
+            None => is_azure || auth.requires_encryption(),
+        };
+        // Azure 必须校验证书；集成认证则是 TLS 握手后仍可能用到自签证书，
+        // 本地/自建实例为方便起见默认信任。
         let trust_server_certificate = !is_azure;
         Self {
             server,
@@ -123,10 +152,6 @@ fn parse_port(value: Option<&str>) -> Result<u16> {
             .parse::<u16>()
             .with_context(|| format!("Invalid MSSQL_PORT value: {raw}")),
     }
-}
-
-fn parse_bool(value: Option<&str>) -> bool {
-    matches!(value, Some(v) if v.eq_ignore_ascii_case("true"))
 }
 
 /// `MSSQL_AUTH` 的认证模式。
@@ -193,7 +218,7 @@ mod tests {
         ("MSSQL_PASSWORD", "pass"),
     ];
 
-    fn build_config(server: &str, encrypt_env: bool) -> DbConfig {
+    fn build_config(server: &str, encrypt_env: Option<bool>) -> DbConfig {
         DbConfig::build(
             server.to_string(),
             1433,
@@ -208,7 +233,8 @@ mod tests {
 
     #[test]
     fn build_defaults_to_unencrypted_for_local_server() {
-        let config = build_config("localhost", false);
+        // SQL 登录且未指定：保持明文默认，兼容既有本地自签实例。
+        let config = build_config("localhost", None);
         assert!(!config.encrypt);
         assert!(config.trust_server_certificate);
         assert!(!config.is_azure());
@@ -216,14 +242,21 @@ mod tests {
 
     #[test]
     fn build_respects_encrypt_env_for_local_server() {
-        let config = build_config("localhost", true);
+        let config = build_config("localhost", Some(true));
         assert!(config.encrypt);
         assert!(config.trust_server_certificate);
     }
 
     #[test]
+    fn build_respects_explicit_plaintext_request() {
+        let config = build_config("localhost", Some(false));
+        assert!(!config.encrypt);
+    }
+
+    #[test]
     fn build_forces_encryption_on_azure() {
-        let config = build_config("myserver.database.windows.net", false);
+        // Azure 必须加密：即使显式关闭也不能放行明文。
+        let config = build_config("myserver.database.windows.net", Some(false));
         assert!(config.is_azure());
         assert!(config.encrypt);
         assert!(!config.trust_server_certificate);
@@ -231,7 +264,7 @@ mod tests {
 
     #[test]
     fn build_detects_azure_case_insensitively() {
-        let config = build_config("MyServer.Database.Windows.NET", false);
+        let config = build_config("MyServer.Database.Windows.NET", None);
         assert!(config.is_azure());
     }
 
@@ -242,14 +275,6 @@ mod tests {
         assert_eq!(parse_port(Some("1434")).unwrap(), 1434);
         assert!(parse_port(Some("not-a-port")).is_err());
         assert!(parse_port(Some("99999")).is_err());
-    }
-
-    #[test]
-    fn parse_bool_only_accepts_true() {
-        assert!(parse_bool(Some("true")));
-        assert!(parse_bool(Some("TRUE")));
-        assert!(!parse_bool(Some("false")));
-        assert!(!parse_bool(None));
     }
 
     #[test]
@@ -416,13 +441,74 @@ mod tests {
             1433,
             "testdb".to_string(),
             AuthKind::WindowsIntegrated,
-            false,
+            None,
         );
         assert_eq!(config.auth, AuthKind::WindowsIntegrated);
         assert_eq!(
             config.auth.describe(),
             "current Windows user (integrated auth)"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_encrypts_integrated_auth_by_default() {
+        // 回归点：集成认证的 NTLM/Kerberos 握手在线路上传输凭据，未指定
+        // MSSQL_ENCRYPT 时必须包进 TLS，不能沿用 SQL 登录的明文默认。
+        let config = DbConfig::build(
+            "localhost".to_string(),
+            1433,
+            "testdb".to_string(),
+            AuthKind::WindowsIntegrated,
+            None,
+        );
+        assert!(config.encrypt, "integrated auth must default to TLS");
+
+        let sql_login = DbConfig::build(
+            "localhost".to_string(),
+            1433,
+            "testdb".to_string(),
+            AuthKind::SqlServer {
+                user: "sa".to_string(),
+                password: "pass".to_string(),
+            },
+            None,
+        );
+        assert!(
+            !sql_login.encrypt,
+            "SQL login plaintext default must stay unchanged"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_honors_explicit_plaintext_for_integrated_auth() {
+        // 显式 MSSQL_ENCRYPT=false 是用户有意为之，必须尊重
+        // （本地自签证书排查等场景）。
+        let config = DbConfig::build(
+            "localhost".to_string(),
+            1433,
+            "testdb".to_string(),
+            AuthKind::WindowsIntegrated,
+            Some(false),
+        );
+        assert!(!config.encrypt);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn from_lookup_encrypts_integrated_auth_end_to_end() {
+        let pairs = &[("MSSQL_DATABASE", "testdb"), ("MSSQL_AUTH", "windows")];
+        let config = DbConfig::from_lookup(&lookup_from(pairs)).unwrap();
+        assert!(config.encrypt, "must enable TLS for integrated auth");
+
+        let explicit = &[
+            ("MSSQL_DATABASE", "testdb"),
+            ("MSSQL_AUTH", "windows"),
+            ("MSSQL_ENCRYPT", "false"),
+        ];
+        let config = DbConfig::from_lookup(&lookup_from(explicit)).unwrap();
+        assert!(!config.encrypt, "explicit opt-out must be honored");
     }
 
     #[cfg(windows)]
