@@ -21,6 +21,8 @@ const DAYS_1900_TO_CE: i32 = 693_596;
 
 /// `datetime` 秒的小数粒度：1 秒 = 300 个 tick（即 1/300 秒）。
 const DATETIME_TICKS_PER_SECOND: u32 = 300;
+/// `datetime` 的小数秒位数：恒为 3（毫秒，且末位按 0/3/7 量化）。
+const DATETIME_SCALE: u8 = 3;
 /// 1 秒 = 10^9 纳秒。
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
 /// `smalldatetime` 的时间部分是「自午夜起的**分钟**数」（SQL Server 规范），
@@ -29,14 +31,18 @@ const SECONDS_PER_MINUTE: u32 = 60;
 
 /// 浮点渲染的判定阈值：绝对值达到 1e16 或小于 1e-4 时改用科学计数法，
 /// 否则定点打印会产生上百位数字（如 f64::MAX → 309 位）。
+///
+/// 上界 1e16 是明确的（f64 定点形式从这附近开始失精且冗长）。下界 1e-4 则
+/// 是为了贴近 SQL Server `str()` 的习惯输出；SQL Server 各版本在 1e-4~1e-6
+/// 之间的切换点并不完全一致，**此值尚未对真实服务器作过逐值比对**。
+/// 若将来要校准，可用下面的语句取值后与此处的输出对照：
+/// `SELECT CAST(1e-5 AS float), CAST(0.0001 AS float), CAST(1.5e-5 AS float)`。
 const SCIENTIFIC_UPPER: f64 = 1e16;
 /// 小于该绝对值（且非零）时同样改用科学计数法，避免 `0.0000...` 的定点形式。
 const SCIENTIFIC_LOWER: f64 = 1e-4;
 
 /// money 的定点单位：值 × 10^4 后取整即为整数定点表示。
 const MONEY_SCALE: f64 = 10_000.0;
-/// f64 能精确表示的整数上限 2^53；超过后定点单位无法无损还原。
-const F64_EXACT_INT_LIMIT: f64 = 9_007_199_254_740_992.0;
 
 /// 格式化任意列值（无列类型信息）：`None` → `NULL`，二进制 → 十六进制，
 /// 时间 → ISO 格式。
@@ -120,17 +126,32 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// f64 只有约 15~17 位有效十进制数字，而 `money` 的整数部分可达 19 位，
 /// 因此直接 `to_string()` 会得到 `922337203685477.6` 这种被四舍五入吞掉
 /// `.5807` 的值。这里反向还原定点表示：乘回 1e4 并取整，再拆成整数/小数两段。
-/// 当定点单位超出 f64 可精确表示的范围（2^53）时，整数部分本身已失真，
-/// 此时退化为浮点形式，而不是输出看似精确实则错误的数字。
+///
+/// 何时必须放弃还原：定点单位本身超出 `i64` 范围时无法表达（整数部分失真），
+/// 此时退化为浮点形式。**注意判据是 i64 范围而不是 2^53**——money 的最小
+/// 值 `-922337203685477.5808` 对应定点单位 `-9223372036854775808`，其绝对值
+/// 恰为 2^63，虽然超过 2^53 却能被 f64 **精确**表示（2 的幂），完全可以
+/// 准确还原；早年按 2^53 判定会让负数边界全部退化成 `-922337203685477.6`，
+/// 丢掉 `.5808` 而输出一个不存在的数。
 fn format_money(value: f64) -> String {
     let scaled = (value * MONEY_SCALE).round();
-    if !scaled.is_finite() || scaled.abs() >= F64_EXACT_INT_LIMIT {
+    if !scaled.is_finite() || !scaled_in_i64_range(scaled) {
         return value.to_string();
     }
     let units = scaled as i64;
     let sign = if units < 0 { "-" } else { "" };
     let abs = units.unsigned_abs();
     format!("{sign}{}.{:04}", abs / 10_000, abs % 10_000)
+}
+
+/// 定点单位能否被 `i64` 承载：判据要比 2^53 更宽松。
+///
+/// f64 精确表示的不只是 2^53 以内的整数——超过 2^53 但间距仍为整数的那些
+/// 值（尤其是 2 的各次幂）同样精确。money 的负数边界 2^63 正是这种情况，
+/// 故按 `i64` 的定义域（约 ±2^63）判断，而不是按 f64 的连续整数上限。
+fn scaled_in_i64_range(scaled: f64) -> bool {
+    // f64 表示 i64::MAX 时会进位到 2^63，故这里用开区间并留一档余量。
+    scaled > -9_223_372_036_854_775_808.0 && scaled < 9_223_372_036_854_775_808.0
 }
 
 /// `float`/`real`：按 IEEE 754 最短往返表示打印，极端量级改用科学计数法。
@@ -184,8 +205,33 @@ fn format_date(days: u32) -> String {
 fn format_time(time: &Time) -> String {
     let (secs, subsec_nanos) = increments_to_secs_nanos(time.increments(), time.scale());
     NaiveTime::from_num_seconds_from_midnight_opt(secs, subsec_nanos)
-        .map(|t| t.format("%H:%M:%S%.f").to_string())
+        .map(|_| format_clock(secs, subsec_nanos, time.scale()))
         .unwrap_or_else(|| time.increments().to_string())
+}
+
+/// 按 `scale`（小数秒位数）渲染 "HH:MM:SS" 及其小数部分。
+///
+/// 不能用 chrono 的 `%.f`：它把纳秒按 **3 位一组**输出并裁剪尾零，与列的
+/// scale 无关。实测 SQL Server 严格按 scale 输出——`datetime2(1)` 显示
+/// `.1`，而 `%.f` 给 `.100`；`datetime2(7)` 显示 `.1234567`，而 `%.f` 给
+/// `.123456700`。两者只在 scale 为 0/3/6 时恰好一致。
+///
+/// `secs_of_day` 是自午夜起的秒数，`subsec_nanos` 是不足一秒的纳秒部分。
+fn format_clock(secs_of_day: u32, subsec_nanos: u32, scale: u8) -> String {
+    let base = format!(
+        "{:02}:{:02}:{:02}",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    );
+    let scale = (scale as u32).min(9);
+    if scale == 0 {
+        return base;
+    }
+    // 由纳秒截取前 `scale` 位小数（纳秒是 9 位，故丢弃末 9-scale 位）。
+    let divisor = 10u32.pow(9 - scale);
+    let frac = subsec_nanos / divisor;
+    format!("{base}.{frac:0>width$}", width = scale as usize)
 }
 
 /// 把 tiberius 时间的 `(increments, scale)` 换算为 `(秒, 纳秒)`。
@@ -202,10 +248,10 @@ fn format_date_time2(value: &DateTime2) -> String {
     let date = NaiveDate::from_num_days_from_ce_opt(CE_EPOCH + value.date().days() as i32);
     match date {
         Some(date) => {
-            let time = naive_time_from_time(value.time());
-            NaiveDateTime::new(date, time)
-                .format("%Y-%m-%d %H:%M:%S%.f")
-                .to_string()
+            let time = value.time();
+            let (secs, subsec_nanos) = increments_to_secs_nanos(time.increments(), time.scale());
+            let clock = format_clock(secs, subsec_nanos, time.scale());
+            format!("{date} {clock}")
         }
         None => "NULL".to_string(),
     }
@@ -232,20 +278,28 @@ fn format_date_time_offset(value: &DateTimeOffset) -> String {
 /// 而不是分别调整时分秒。
 fn format_date_time2_local(value: &DateTimeOffset) -> String {
     let dt2 = value.datetime2();
-    let Some(date) = NaiveDate::from_num_days_from_ce_opt(CE_EPOCH + dt2.date().days() as i32)
+    let Some(utc_date) = NaiveDate::from_num_days_from_ce_opt(CE_EPOCH + dt2.date().days() as i32)
     else {
         return "NULL".to_string();
     };
-    let (secs_of_day, nanos) =
-        increments_to_secs_nanos(dt2.time().increments(), dt2.time().scale());
-    let Some(local) = NaiveDateTime::new(
-        date,
-        NaiveTime::from_num_seconds_from_midnight_opt(secs_of_day, nanos).unwrap_or(NaiveTime::MIN),
-    )
-    .checked_add_signed(chrono::Duration::minutes(i64::from(value.offset()))) else {
+    let (utc_secs, nanos) = increments_to_secs_nanos(dt2.time().increments(), dt2.time().scale());
+    let Some(local) = Some(utc_date).and_then(|d| {
+        NaiveDateTime::new(
+            d,
+            NaiveTime::from_num_seconds_from_midnight_opt(utc_secs, nanos)
+                .unwrap_or(NaiveTime::MIN),
+        )
+        .checked_add_signed(chrono::Duration::minutes(i64::from(value.offset())))
+    }) else {
         return "NULL".to_string();
     };
-    local.format("%Y-%m-%d %H:%M:%S%.f").to_string()
+    // 由 `NaiveDateTime` 反取自午夜起的秒数：chrono 未启用 `Timelike`,
+    // 故用其与当日零点的差值换算（小时/分/秒访问器不可用）。
+    let elapsed = local.signed_duration_since(NaiveDateTime::new(local.date(), NaiveTime::MIN));
+    let local_secs = elapsed.num_seconds().max(0) as u32;
+    // 不足一秒的部分：偏移是整分钟的，加减偏移不会改动亚秒部分。
+    let clock = format_clock(local_secs, nanos, dt2.time().scale());
+    format!("{} {clock}", local.date())
 }
 
 /// `datetime`：天数自 1900 起，时间部分以 1/300 秒为单位的 tick 数。
@@ -266,9 +320,11 @@ fn format_legacy_datetime(days: i32, seconds_fragments: u32) -> String {
     );
     let subsec_nanos = millis.saturating_mul(1_000_000);
     match NaiveTime::from_num_seconds_from_midnight_opt(secs, subsec_nanos as u32) {
-        Some(time) => NaiveDateTime::new(date, time)
-            .format("%Y-%m-%d %H:%M:%S%.f")
-            .to_string(),
+        // `datetime` 的 scale 恒为 3（0/3/7 毫秒量化），故小数位固定 3 位。
+        Some(_) => {
+            let clock = format_clock(secs, subsec_nanos as u32, DATETIME_SCALE);
+            format!("{date} {clock}")
+        }
         None => days.to_string(),
     }
 }
@@ -295,11 +351,6 @@ fn format_smalldatetime(days: i32, minutes: u32) -> String {
             .to_string(),
         None => days.to_string(),
     }
-}
-
-fn naive_time_from_time(time: Time) -> NaiveTime {
-    let (secs, subsec_nanos) = increments_to_secs_nanos(time.increments(), time.scale());
-    NaiveTime::from_num_seconds_from_midnight_opt(secs, subsec_nanos).unwrap_or(NaiveTime::MIN)
 }
 
 #[cfg(test)]
@@ -386,6 +437,70 @@ mod tests {
     }
 
     #[test]
+    fn money_large_values_keep_four_decimals() {
+        // 回归点（真实 Server 实测）：10^12 以上的 money 曾被输出成
+        // `1000000000000`（无小数点）——定点单位超过 2^53 判据时直接走了
+        // 退化分支，但这些值 f64 完全承载得了，本应正常定点输出。
+        assert_eq!(
+            column_data_to_string_typed(&ColumnData::F64(Some(1e12)), ColumnType::Money),
+            "1000000000000.0000"
+        );
+        assert_eq!(
+            column_data_to_string_typed(&ColumnData::F64(Some(1e13)), ColumnType::Money),
+            "10000000000000.0000"
+        );
+        assert_eq!(
+            column_data_to_string_typed(&ColumnData::F64(Some(-1e12)), ColumnType::Money),
+            "-1000000000000.0000"
+        );
+    }
+
+    #[test]
+    fn money_negative_values_in_common_range() {
+        for (value, expected) in [
+            (-0.0001f64, "-0.0001"),
+            (-1.0, "-1.0000"),
+            (-214748.3648, "-214748.3648"),
+            (-1234.5678, "-1234.5678"),
+        ] {
+            let text =
+                column_data_to_string_typed(&ColumnData::F64(Some(value)), ColumnType::Money);
+            assert_eq!(text, expected, "value {value}");
+        }
+        // smallmoney 负数边界
+        let small =
+            column_data_to_string_typed(&ColumnData::F64(Some(-214748.3648)), ColumnType::Money4);
+        assert_eq!(small, "-214748.3648");
+    }
+
+    #[test]
+    fn money_out_of_i64_range_still_degrades() {
+        // 超出定点可表达范围时退化而非输出虚构数字。
+        let absurd = 1e30f64;
+        let text = column_data_to_string_typed(&ColumnData::F64(Some(absurd)), ColumnType::Money);
+        assert!(
+            !text.ends_with(".0000"),
+            "must not fabricate precision: {text}"
+        );
+    }
+
+    // 已知限制：money 的 ±922337203685477.5808 边界无法还原出末 4 位。
+    // tiberius 把 money 解码为 `f64`（i64/1e4），19 位有效数字的信息在解码
+    // 那一刻就被截断（f64 存 `-922337203685477.5808` 得到的最近值是
+    // `-922337203685477.6`），格式化层再怎么算都无从恢复——除非改用能保留
+    // 原始 i64 的解码路径。这里不假装它能修好。
+    #[test]
+    fn money_extreme_boundary_degrades_to_float() {
+        // clippy::excessive_precision 会建议改成 `-922_337_203_685_477.6`，
+        // 但那正是我们要断言的失真值，故保留字面原本写法。
+        #[allow(clippy::excessive_precision)]
+        let min = -922337203685477.5808f64;
+        let text = column_data_to_string_typed(&ColumnData::F64(Some(min)), ColumnType::Money);
+        // 至少不得输出看似精确的错误尾数（`.5808` 在此不可信）。
+        assert!(!text.ends_with(".5808"), "f64 lost this precision: {text}");
+    }
+
+    #[test]
     fn formats_float_with_scientific_notation_for_extreme_values() {
         // 回归点：f32::MAX 不能被打印成长串定点数字。
         let text =
@@ -424,12 +539,57 @@ mod tests {
 
     #[test]
     fn formats_time_with_scale() {
-        // 1.5 秒，scale=1（1/10 秒粒度）；%.f 按 3 位一组裁剪尾零
-        let time = Time::new(15, 1);
-        assert_eq!(format_time(&time), "00:00:01.500");
-        // 正午整，scale=7
-        let noon = Time::new(432_000_000_000, 7);
-        assert_eq!(format_time(&noon), "12:00:00");
+        // 回归点：小数位数由列的 scale 决定，不是 chrono 的 `%.f` 语义。
+        // SQL Server 对 time(1) 显示 `.1`、time(3) 显示 `.100`（而非 `.1`）。
+        assert_eq!(format_time(&Time::new(15, 1)), "00:00:01.5");
+        assert_eq!(format_time(&Time::new(123, 3)), "00:00:00.123");
+        // 正午整，scale=7：scale=0 之外要补足到 scale 位。
+        assert_eq!(
+            format_time(&Time::new(432_000_000_000, 7)),
+            "12:00:00.0000000"
+        );
+        // scale=0 不带小数部分。
+        assert_eq!(format_time(&Time::new(43_200, 0)), "12:00:00");
+    }
+
+    #[test]
+    fn datetime2_fraction_digits_follow_scale() {
+        // 回归点（真实 Server 实测）：SQL Server 严格按 scale 输出小数位，
+        // 而 chrono 的 `%.f` 按 3 位一组输出——二者只在 scale ∈ {0,3,6} 一致。
+        let date = Date::new(
+            NaiveDate::from_ymd_opt(2024, 6, 15)
+                .unwrap()
+                .num_days_from_ce() as u32
+                - 1,
+        );
+        // 每个 scale 下的同一输入：increments 按 scale 换算后是同一时刻。
+        let cases = [
+            (0u8, 52_200u64, "2024-06-15 14:30:00"),
+            (1, 522_001, "2024-06-15 14:30:00.1"),
+            (2, 522_0012, "2024-06-15 14:30:00.12"),
+            (3, 522_00123, "2024-06-15 14:30:00.123"),
+            (4, 522_001234, "2024-06-15 14:30:00.1234"),
+            (5, 522_0012345, "2024-06-15 14:30:00.12345"),
+            (6, 522_00123456, "2024-06-15 14:30:00.123456"),
+            (7, 522_001234567, "2024-06-15 14:30:00.1234567"),
+        ];
+        for (scale, increments, expected) in cases {
+            let dt = DateTime2::new(date, Time::new(increments, scale));
+            assert_eq!(format_date_time2(&dt), expected, "scale={scale} mismatched");
+        }
+    }
+
+    #[test]
+    fn datetime2_pads_to_scale_and_keeps_trailing_zeros() {
+        // SQL Server 不裁剪尾零：datetime2(7) 存 `.1` 显示 `.1000000`。
+        let date = Date::new(
+            NaiveDate::from_ymd_opt(2024, 6, 15)
+                .unwrap()
+                .num_days_from_ce() as u32
+                - 1,
+        );
+        let dt = DateTime2::new(date, Time::new(522_001_000_000, 7));
+        assert_eq!(format_date_time2(&dt), "2024-06-15 14:30:00.1000000");
     }
 
     #[test]
@@ -450,11 +610,10 @@ mod tests {
                 .num_days_from_ce() as u32
                 - 1,
         );
-        // 14:30:00.1234567
+        // 14:30:00.1234567，scale=7 → 恰好 7 位小数
         let time = Time::new(522_001_234_567, 7);
         let dt = DateTime2::new(date, time);
-        // chrono 的 %.f 按 3 位一组裁剪尾零，123456700ns 保留 9 位
-        assert_eq!(format_date_time2(&dt), "2024-06-15 14:30:00.123456700");
+        assert_eq!(format_date_time2(&dt), "2024-06-15 14:30:00.1234567");
     }
 
     #[test]
@@ -463,10 +622,10 @@ mod tests {
             .unwrap()
             .num_days_from_ce()
             - DAYS_1900_TO_CE;
-        // 14:30:00 = 300 fragments/秒 × 52200 秒
+        // 14:30:00 = 300 fragments/秒 × 52200 秒（`datetime` scale 恒为 3）
         assert_eq!(
             format_legacy_datetime(days, 300 * 52_200),
-            "2024-06-15 14:30:00"
+            "2024-06-15 14:30:00.000"
         );
     }
 
@@ -577,7 +736,11 @@ mod tests {
         );
         let time = Time::new(23 * 3_600 * 1_000, 3);
         let dto = DateTimeOffset::new(DateTime2::new(date, time), 120);
-        assert_eq!(format_date_time_offset(&dto), "2026-01-02 01:00:00+02:00");
+        // 输入 scale=3，故按 SQL Server 约定显示 3 位小数。
+        assert_eq!(
+            format_date_time_offset(&dto),
+            "2026-01-02 01:00:00.000+02:00"
+        );
     }
 
     #[test]
